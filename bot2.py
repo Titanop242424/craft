@@ -17,8 +17,8 @@ from telegram.error import RetryAfter
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
 # ================= CONFIG =================
-BOT_TOKEN = "7607323107:AAG1Xk0_ztpRSSGfIX-vl0RWAYRNJZu65b4"  # Replace with your bot token
-ADMIN_IDS = [1909392304]  # Replace with your admin Telegram IDs
+BOT_TOKEN = "8680371930:AAFgIIrLBQi_YlEBdVIZCfL9k9AWdGf-Yqw"  # Replace with your bot token
+ADMIN_IDS = [8888758201]  # Replace with your admin Telegram IDs
 
 # Same encryption keys as CLI version
 KEY = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
