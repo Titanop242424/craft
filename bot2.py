@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🔥 FF CARFT LAND FOLLOW BOT — ULTRA FAST EDITION (v6.1)
+🔥 FF CARFT LAND FOLLOW BOT — ULTRA FAST EDITION (v6.2)
 • All commands defined
 • Instant response with aggressive concurrency
 • 128 thread executor for maximum parallelism
+• Non-blocking notifications
 """
 
 import asyncio
@@ -560,6 +561,51 @@ async def notify_admin_limit_reached(context: ContextTypes.DEFAULT_TYPE, uid: st
             pass
 
 # ══════════════════════════════════════════════════════════════
+# 📢 NOTIFICATIONS — NON-BLOCKING
+# ══════════════════════════════════════════════════════════════
+
+async def _send_single_notification(context: ContextTypes.DEFAULT_TYPE, uid: int, message: str):
+    """Send a single notification."""
+    try:
+        await context.bot.send_message(uid, message, parse_mode=ParseMode.MARKDOWN)
+        return 1
+    except Exception:
+        return 0
+
+async def _send_notifications_async(context: ContextTypes.DEFAULT_TYPE, user_ids: list, new: int):
+    """Send notifications in background without blocking."""
+    message = (
+        f"📦 *NEW STOCK!*\n"
+        f"🎉 *{new}* fresh accounts added!\n"
+        f"🚀 `/follow <UID>`"
+    )
+    
+    # Send in batches of 50 to avoid rate limits
+    batch_size = 50
+    for i in range(0, len(user_ids), batch_size):
+        batch = user_ids[i:i+batch_size]
+        tasks = [_send_single_notification(context, uid, message) for uid in batch]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.sleep(0.1)  # Small delay between batches
+
+async def notify_stock_update(context: ContextTypes.DEFAULT_TYPE, new: int) -> int:
+    """Send stock notifications in background without blocking the bot."""
+    if new <= 0:
+        return 0
+    
+    # Get user IDs in background
+    user_ids = await _run(lambda: [u["_id"] for u in users_coll.find({}, {"_id": 1})])
+    
+    if not user_ids:
+        return 0
+    
+    # Create notification task in background - doesn't block the main loop
+    asyncio.create_task(_send_notifications_async(context, user_ids, new))
+    
+    # Return immediately - don't wait for notifications to complete
+    return len(user_ids)
+
+# ══════════════════════════════════════════════════════════════
 # 🚀 ULTRA FAST FOLLOW ENGINE
 # ══════════════════════════════════════════════════════════════
 async def run_follow_job(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -1075,23 +1121,6 @@ async def broadcast_media(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await asyncio.sleep(0.05)
     return sent
 
-async def notify_stock_update(context: ContextTypes.DEFAULT_TYPE, new: int) -> int:
-    if new <= 0:
-        return 0
-    sent = 0
-    user_ids = await _run(lambda: [u["_id"] for u in users_coll.find({}, {"_id": 1})])
-    for uid_ in user_ids:
-        try:
-            await context.bot.send_message(
-                uid_,
-                f"📦 *NEW STOCK!*\n🎉 *{new}* fresh accounts added!\n🚀 `/follow <UID>`",
-                parse_mode=ParseMode.MARKDOWN)
-            sent += 1
-        except Exception:
-            pass
-        await asyncio.sleep(0.05)
-    return sent
-
 def store_accounts_sync(content: str):
     accounts = parse_accounts(content)
     new = dup = err = 0
@@ -1402,10 +1431,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         ud["upload_waiting"] = False
         new, dup, err = await store_accounts(text)
+        # Start notification in background - don't wait
         notified = await notify_stock_update(context, new) if new > 0 else 0
+        # Send immediate response to admin
         await update.message.reply_text(
             f"📦 *Upload complete*\n✅ New: {new} | ⏭️ Dup: {dup} | ❌ Err: {err}"
-            + (f"\n📢 Notified *{notified}* users!" if notified else ""),
+            + (f"\n📢 Notifying *{notified}* users in background..." if notified else ""),
             parse_mode=ParseMode.MARKDOWN)
         return
 
@@ -1485,7 +1516,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         notified = await notify_stock_update(context, new) if new > 0 else 0
         await update.message.reply_text(
             f"📦 *Uploaded*\n✅ New: {new} | ⏭️ Dup: {dup} | ❌ Err: {err}"
-            + (f"\n📢 Notified *{notified}* users!" if notified else ""),
+            + (f"\n📢 Notifying *{notified}* users in background..." if notified else ""),
             parse_mode=ParseMode.MARKDOWN)
         return
 
@@ -1518,7 +1549,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             notified = await notify_stock_update(context, new) if new > 0 else 0
             await update.message.reply_text(
                 f"📦 File `{doc.file_name}`\n✅ New: {new} | ⏭️ Dup: {dup} | ❌ Err: {err}"
-                + (f"\n📢 Notified *{notified}* users!" if notified else ""),
+                + (f"\n📢 Notifying *{notified}* users in background..." if notified else ""),
                 parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
             await update.message.reply_text(f"❌ Upload error: {e}")
@@ -1591,8 +1622,12 @@ def main():
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND & ~filters.UpdateType.CHANNEL_POST & ~filters.UpdateType.EDITED_MESSAGE & ~filters.UpdateType.EDITED_CHANNEL_POST, handle_media))
     app.add_error_handler(error_handler)
 
-    logger.info("🔥 ULTRA FAST BOT ONLINE (v6.1)…")
+    logger.info("🔥 ULTRA FAST BOT ONLINE (v6.2 - Non-blocking Notifications)…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
+
+# python3 -m pip uninstall protobuf google -y
+# python3 -m pip install protobuf==7.35.1
+# python3 -m pip install google==3.0.0
