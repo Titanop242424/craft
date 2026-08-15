@@ -1,2111 +1,1598 @@
-# bot.py - Complete Working Telegram Bot with Progress Bars, Coin System & Concurrency
-import json
-import requests
-import os
-import re
-import time
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+🔥 FF CARFT LAND FOLLOW BOT — ULTRA FAST EDITION (v6.1)
+• All commands defined
+• Instant response with aggressive concurrency
+• 128 thread executor for maximum parallelism
+"""
+
 import asyncio
-import threading
-import sys
-import uuid
-from datetime import datetime
+import concurrent.futures
+import json
+import logging
+import re
+import warnings
+from datetime import datetime, date, timedelta
+
+import requests
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from google.protobuf.json_format import MessageToDict
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import RetryAfter
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
+from bson import ObjectId
 
-# ================= CONFIG =================
-BOT_TOKEN = "8680371930:AAFgIIrLBQi_YlEBdVIZCfL9k9AWdGf-Yqw"  # Replace with your bot token
-ADMIN_IDS = [8888758201]  # Replace with your admin Telegram IDs
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.constants import ParseMode
+from telegram.error import BadRequest
+from telegram.helpers import escape_markdown
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, filters, ContextTypes,
+)
 
-# Same encryption keys as CLI version
-KEY = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
-IV = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
+import follow_pb2
 
-JWT_API = "https://ff-jwt-gen-api.lovable.app/api/public/token"
-URL = "https://client.ind.freefiremobile.com/Follow"
+# silence harmless Atlas TLS cert warning
+warnings.filterwarnings("ignore", message="Parsed a serial number")
 
-# Protobuf module (keep follow_pb2.py next to this file)
-try:
-    import follow_pb2
-except ImportError:
-    follow_pb2 = None
-    print("⚠️ follow_pb2.py not found! Follow requests will not work.")
+# ── Silence Telegram/httpx log spam ──
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
-# ================= JSON STORAGE (atomic, thread-safe) =================
-# RLock is RE-ENTRANT: update_data() can safely call load_data() while holding it.
-# A plain Lock here caused a deadlock on the first account upload -> bot froze.
-DATA_FILE = "ff_bot_data.json"
-data_lock = threading.RLock()
+# ══════════════════════════════════════════════════════════════
+# ⚡ MASSIVE THREAD EXECUTOR — MAXIMUM CONCURRENCY
+# ══════════════════════════════════════════════════════════════
+_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=128)
 
-def load_data():
-    """Load data from JSON file"""
-    with data_lock:
-        if os.path.exists(DATA_FILE):
-            try:
-                with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except:
-                pass
-        return {
-            "users": {},
-            "referrals": [],
-            "accounts": [],
-            "follow_history": [],
-            "followed_targets": [],
-            "admins": ADMIN_IDS.copy(),
-            "channels": [],
-            "settings": {
-                "daily_coins": 5,
-                "referral_coins": 5,
-                "follow_delay": 2
-            }
+async def _run(fn, *args):
+    """Run a BLOCKING call in a worker thread with maximum speed."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_EXECUTOR, fn, *args)
+
+# ══════════════════════════════════════════════════════════════
+# 🔧 CONFIG — EDIT THESE
+# ══════════════════════════════════════════════════════════════
+BOT_TOKEN    = "8680371930:AAFgIIrLBQi_YlEBdVIZCfL9k9AWdGf-Yqw"
+ADMIN_IDS    = [8888758201]
+MONGO_URI    = "mongodb+srv://titanop24:titanop24@cluster0.7lvigzh.mongodb.net/?appName=Cluster0"
+DB_NAME      = "ff_carft_land"
+BOT_USERNAME = "ffcarftlandbot"
+
+# Game API
+KEY         = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
+IV          = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
+JWT_API     = "https://ff-jwt-gen-api.lovable.app/api/public/token"
+FOLLOW_URL  = "https://client.ind.freefiremobile.com/Follow"
+
+DAILY_COINS = 5
+REF_COINS   = 5
+MAX_CAP     = 50
+FOLLOW_DELAY = 0.5
+BATCH_SIZE  = 20
+
+# ══════════════════════════════════════════════════════════════
+# 🎨 UI
+# ══════════════════════════════════════════════════════════════
+THIN = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+def box(title: str) -> str:
+    return f"╔{'═'*44}╗\n║{title.center(44)}║\n╚{'═'*44}╝"
+
+def B(text: str, cb: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text, callback_data=cb)
+
+def back_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[B("⬅️ Back", "menu_main")]])
+
+def E(t):
+    return escape_markdown(str(t), version=1)
+
+async def safe_edit(q, text: str, parse_mode=None, reply_markup=None):
+    try:
+        await q.edit_message_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+    except BadRequest:
+        pass
+
+# ══════════════════════════════════════════════════════════════
+# 🗄️ MONGODB — OPTIMIZED
+# ══════════════════════════════════════════════════════════════
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+_client = MongoClient(MONGO_URI, maxPoolSize=200, minPoolSize=50)
+db      = _client[DB_NAME]
+users_coll     = db.users
+accounts_coll  = db.accounts
+log_coll       = db.follow_logs
+settings_coll  = db.settings
+referral_logs  = db.referral_logs
+channels_coll  = db.channels
+admin_coll     = db.admins
+error_logs_coll = db.error_logs
+
+# Create all indexes for maximum speed
+def create_indexes():
+    try:
+        accounts_coll.create_index("uid", unique=True)
+        accounts_coll.create_index([("status", 1), ("capacity", -1)])
+        accounts_coll.create_index("status")
+        accounts_coll.create_index("capacity")
+        log_coll.create_index("at")
+        referral_logs.create_index([("ref_by", 1), ("at", -1)])
+        admin_coll.create_index("user_id", unique=True)
+        error_logs_coll.create_index([("uid", 1), ("at", -1)])
+        users_coll.create_index("_id")
+    except Exception as e:
+        logger.warning("Index creation warning: %s", e)
+
+create_indexes()
+
+# Cache settings for ultra-fast access
+_settings_cache = None
+_settings_cache_time = None
+
+def get_settings_cached():
+    global _settings_cache, _settings_cache_time
+    now = datetime.utcnow()
+    if _settings_cache is None or _settings_cache_time is None or (now - _settings_cache_time).seconds > 60:
+        s = settings_coll.find_one({"_id": "config"}) or {}
+        _settings_cache = {
+            "daily_coins": int(s.get("daily_coins", DAILY_COINS)),
+            "ref_coins":   int(s.get("ref_coins", REF_COINS)),
         }
+        _settings_cache_time = now
+    return _settings_cache
 
-def save_data(data):
-    """Save data to JSON file"""
-    with data_lock:
-        with open(DATA_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+def init_admins():
+    for admin_id in ADMIN_IDS:
+        try:
+            admin_coll.update_one(
+                {"user_id": admin_id},
+                {"$set": {"user_id": admin_id, "added_at": datetime.utcnow()}},
+                upsert=True
+            )
+        except Exception:
+            pass
+init_admins()
 
-def update_data(mutator):
-    """Atomic read-modify-write under one lock (safe for concurrent requests)"""
-    with data_lock:
-        data = load_data()  # RLock allows this re-entry
-        result = mutator(data)
-        with open(DATA_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        return result
+def get_settings() -> dict:
+    return get_settings_cached()
 
-# ================= IN-MEMORY ACCOUNT RESERVATION (concurrency) =================
-_active_accounts = set()          # UIDs currently being used by another request
-_active_lock = threading.Lock()
+def set_setting(key: str, value: int):
+    settings_coll.update_one(
+        {"_id": "config"},
+        {"$set": {key: int(value)}},
+        upsert=True,
+    )
+    global _settings_cache, _settings_cache_time
+    _settings_cache = None
+    _settings_cache_time = None
 
-def reserve_accounts(accounts):
-    """Pick only accounts not already in use by a concurrent request"""
-    with _active_lock:
-        reserved = []
-        for acc in accounts:
-            uid = str(acc[0])
-            if uid not in _active_accounts:
-                _active_accounts.add(uid)
-                reserved.append(acc)
-        return reserved
+def is_admin(user_id: int) -> bool:
+    return admin_coll.find_one({"user_id": user_id}) is not None
 
-def release_accounts(accounts):
-    with _active_lock:
-        for acc in accounts:
-            _active_accounts.discard(str(acc[0]))
+def get_all_admins() -> list:
+    return [a["user_id"] for a in admin_coll.find({}, {"user_id": 1})]
 
-# ================= COIN SYSTEM =================
-def get_user(user_id):
-    data = load_data()
-    return data["users"].get(str(user_id))
-
-def get_user_info(user_id):
-    """Alias for get_user()"""
-    return get_user(user_id)
-
-def generate_referral_code(user_id):
-    return f"ref_{user_id}"
-
-def add_user(user_id, username, first_name, last_name, referred_by=None):
-    data = load_data()
-    user_id_str = str(user_id)
-
-    if user_id_str in data["users"]:
-        return False
-
-    referral_code = generate_referral_code(user_id)
-    joined_date = datetime.now().isoformat()
-
-    data["users"][user_id_str] = {
-        "user_id": user_id,
-        "username": username,
-        "first_name": first_name,
-        "last_name": last_name,
-        "joined_date": joined_date,
-        "referral_code": referral_code,
-        "referred_by": referred_by,
-        "total_follows": 0,
-        "coins": 0,
-        "daily_coins_granted": 0,
-        "last_coin_date": None,
-        "is_banned": False
-    }
-
-    # If referred by someone: record referral + give coins to referrer
-    if referred_by:
-        data["referrals"].append({
-            "referrer_id": referred_by,
-            "referred_id": user_id,
-            "date": joined_date
-        })
-        bonus = data["settings"].get("referral_coins", 5)
-        referrer = data["users"].get(str(referred_by))
-        if referrer:
-            referrer["coins"] = referrer.get("coins", 0) + bonus
-
-    save_data(data)
-    return True
-
-def get_available_coins(user_id):
-    """Return current coin balance (auto-grants daily coins on a new day). Admin = unlimited."""
-    if user_id in load_data().get("admins", []):
-        return 999999
-
-    def mutate(data):
-        user = data["users"].get(str(user_id))
-        if not user:
-            return 0
-        daily = data["settings"].get("daily_coins", 5)
-        today = datetime.now().date().isoformat()
-        if user.get("last_coin_date") != today:
-            user["coins"] = user.get("coins", 0) + daily
-            user["daily_coins_granted"] = daily
-            user["last_coin_date"] = today
-        return user.get("coins", 0)
-
-    return update_data(mutate)
-
-def get_coins_info(user_id):
-    """Returns (balance, daily_granted_today, daily_limit)"""
-    def mutate(data):
-        user = data["users"].get(str(user_id))
-        if not user:
-            return (0, 0, data["settings"].get("daily_coins", 5))
-        if user_id in data.get("admins", []):
-            return (999999, 999999, 999999)
-        daily = data["settings"].get("daily_coins", 5)
-        today = datetime.now().date().isoformat()
-        if user.get("last_coin_date") != today:
-            user["coins"] = user.get("coins", 0) + daily
-            user["daily_coins_granted"] = daily
-            user["last_coin_date"] = today
-        return (user.get("coins", 0), user.get("daily_coins_granted", 0), daily)
-
-    return update_data(mutate)
-
-def spend_coins(user_id, amount=1):
-    """Deduct coins. Returns True if spent. Admin is never charged."""
-    def mutate(data):
-        if user_id in data.get("admins", []):
-            return True
-        user = data["users"].get(str(user_id))
-        if not user:
-            return False
-        if user.get("coins", 0) >= amount:
-            user["coins"] = user["coins"] - amount
-            return True
-        return False
-    return update_data(mutate)
-
-# ================= DATABASE HELPERS =================
-def get_setting(key, default=None):
-    data = load_data()
-    return data["settings"].get(key, default)
-
-def set_setting(key, value):
-    data = load_data()
-    data["settings"][key] = value
-    save_data(data)
-
-def get_available_accounts():
-    data = load_data()
-    accounts = []
-    for acc in data["accounts"]:
-        if acc.get("is_active", True):
-            accounts.append((acc["uid"], acc["password"], acc.get("jwt_token")))
-    return accounts
-
-def get_accounts_count():
-    data = load_data()
-    return len([acc for acc in data["accounts"] if acc.get("is_active", True)])
-
-def get_total_users():
-    data = load_data()
-    return len(data["users"])
-
-def get_today_follows():
-    data = load_data()
-    today = datetime.now().date().isoformat()
-    count = 0
-    for entry in data["follow_history"]:
-        if entry["follow_date"][:10] == today and entry["status"] == "success":
-            count += 1
-    return count
-
-def get_referral_count(user_id):
-    data = load_data()
-    return len([r for r in data["referrals"] if r["referrer_id"] == user_id])
-
-def get_referred_users(user_id):
-    data = load_data()
-    users = []
-    for ref in data["referrals"]:
-        if ref["referrer_id"] == user_id:
-            referred_id = ref["referred_id"]
-            if str(referred_id) in data["users"]:
-                user = data["users"][str(referred_id)]
-                users.append((referred_id, user.get("first_name"), user.get("username"), ref["date"]))
-    return users
-
-def get_user_by_referral_code(ref_code):
-    if not ref_code or not ref_code.startswith('ref_'):
-        return None
+def add_admin(user_id: int) -> bool:
     try:
-        return int(ref_code.replace('ref_', ''))
-    except:
-        return None
-
-def is_admin(user_id):
-    data = load_data()
-    return user_id in data.get("admins", [])
-
-def add_admin(user_id):
-    def mutate(data):
-        if user_id not in data["admins"]:
-            data["admins"].append(user_id)
-            return True
-        return False
-    return update_data(mutate)
-
-def remove_admin(user_id):
-    def mutate(data):
-        if user_id in data["admins"] and user_id not in ADMIN_IDS:
-            data["admins"].remove(user_id)
-            return True
-        return False
-    return update_data(mutate)
-
-def get_channels():
-    data = load_data()
-    return data.get("channels", [])
-
-def add_channel(channel):
-    def mutate(data):
-        if channel not in data["channels"]:
-            data["channels"].append(channel)
-            return True
-        return False
-    return update_data(mutate)
-
-def remove_channel(channel):
-    def mutate(data):
-        if channel in data["channels"]:
-            data["channels"].remove(channel)
-            return True
-        return False
-    return update_data(mutate)
-
-async def is_user_in_channel(user_id, bot, channel_id):
-    """Check if user is a member of the channel/group.
-    NOTE: PTB v20+ bot.get_chat_member() is ASYNC - must be awaited."""
-    try:
-        cid = str(channel_id)
-        if not cid.lstrip('-').isdigit():
-            cid = "@" + cid.lstrip('@')
-        chat_member = await bot.get_chat_member(chat_id=cid, user_id=user_id)
-        return chat_member.status in ['member', 'administrator', 'creator']
+        admin_coll.update_one(
+            {"user_id": user_id},
+            {"$set": {"user_id": user_id, "added_at": datetime.utcnow()}},
+            upsert=True
+        )
+        return True
     except Exception:
         return False
 
-def build_join_keyboard(channels):
-    """Build the 'join channel' keyboard for any stored format (username or numeric id)"""
-    buttons = []
-    for ch in channels:
-        s = str(ch)
-        if s.lstrip('-').isdigit():
-            url = None
-            try:
-                n = abs(int(s))
-                if s.startswith('-100'):
-                    n = int(str(n)[3:])
-                url = f"https://t.me/c/{n}"
-            except Exception:
-                url = None
-            if url:
-                buttons.append([InlineKeyboardButton("📢 Open Channel", url=url)])
-        else:
-            buttons.append([InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{s.lstrip('@')}")])
-    buttons.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_join")])
-    return InlineKeyboardMarkup(buttons)
+def remove_admin(user_id: int) -> bool:
+    result = admin_coll.delete_one({"user_id": user_id})
+    return result.deleted_count > 0
 
-def parse_channel_identifier(text):
-    """
-    Accept channel/group in many formats:
-      https://t.me/username | t.me/username | @username | username | -1001234567890
-    Returns (identifier, kind) where kind is 'public', 'id' or 'private' (unsupported)
-    """
-    t = text.strip()
-    if t.lstrip('-').isdigit():
-        return t, 'id'
-    if t.startswith('@'):
-        return t[1:].strip(), 'public'
-    for prefix in ('https://t.me/', 'http://t.me/', 't.me/'):
-        if t.startswith(prefix):
-            rest = t[len(prefix):].split('?')[0].strip('/')
-            if rest.startswith('+'):
-                return rest, 'private'
-            return rest, 'public'
-    return t, 'public'
+def get_user_sync(uid: int, username: str = "", first_name: str = ""):
+    daily = get_settings()["daily_coins"]
+    today = date.today().isoformat()
+    user = users_coll.find_one({"_id": uid})
+    if not user:
+        user = {
+            "_id": uid, "username": username, "first_name": first_name,
+            "daily_coins": daily, "referral_coins": 0,
+            "total_earned": 0, "total_spent": 0,
+            "last_daily_reset": today, "banned": False,
+            "referred_by": None, "referred_users": [],
+            "created_at": datetime.utcnow(),
+        }
+        users_coll.insert_one(user)
+        return user
+    if user.get("last_daily_reset") != today:
+        users_coll.update_one(
+            {"_id": uid},
+            {"$set": {"daily_coins": daily, "last_daily_reset": today}})
+        user = users_coll.find_one({"_id": uid})
+    return user
 
-def add_account(uid, password, jwt_token=None, added_by=None):
-    def mutate(data):
-        for acc in data["accounts"]:
-            if acc["uid"] == uid:
-                acc["password"] = password
-                if jwt_token:
-                    acc["jwt_token"] = jwt_token
-                return True
-        data["accounts"].append({
-            "uid": uid,
-            "password": password,
-            "jwt_token": jwt_token,
-            "is_active": True,
-            "last_used": None,
-            "total_follows_sent": 0,
-            "added_by": added_by,
-            "added_date": datetime.now().isoformat()
-        })
-        return True
-    return update_data(mutate)
+async def get_user(uid: int, username: str = "", first_name: str = ""):
+    return await _run(get_user_sync, uid, username, first_name)
 
-def mark_followed(account_uid, target_uid, user_id, status, response=""):
-    def mutate(data):
-        data["followed_targets"].append({
-            "account_uid": account_uid,
-            "target_uid": target_uid,
-            "follow_date": datetime.now().isoformat()
-        })
-        data["follow_history"].append({
-            "account_uid": account_uid,
-            "target_uid": target_uid,
-            "user_id": user_id,
-            "follow_date": datetime.now().isoformat(),
-            "status": status,
-            "response": response
-        })
-        return True
-    return update_data(mutate)
+def available_coins(user) -> int:
+    return int(user.get("daily_coins", 0)) + int(user.get("referral_coins", 0))
 
-def is_target_followed_by_account(account_uid, target_uid):
-    data = load_data()
-    for entry in data["followed_targets"]:
-        if entry["account_uid"] == str(account_uid) and entry["target_uid"] == str(target_uid):
-            return True
-    return False
+def spend_coin(user_id: int) -> str:
+    user = users_coll.find_one({"_id": user_id})
+    if int(user.get("daily_coins", 0)) > 0:
+        users_coll.update_one({"_id": user_id},
+            {"$inc": {"daily_coins": -1, "total_spent": 1}})
+        return "daily"
+    users_coll.update_one({"_id": user_id},
+        {"$inc": {"referral_coins": -1, "total_spent": 1}})
+    return "referral"
 
-def update_account_used(uid):
-    def mutate(data):
-        for acc in data["accounts"]:
-            if acc["uid"] == str(uid):
-                acc["last_used"] = datetime.now().isoformat()
-                acc["total_follows_sent"] = acc.get("total_follows_sent", 0) + 1
-                return True
-        return False
-    return update_data(mutate)
-
-def record_success(user_id, uid, target_uid):
-    """Shared bookkeeping after a successful follow: history + coin charge + counters"""
-    mark_followed(str(uid), str(target_uid), user_id, "success")
-    update_account_used(uid)
-    if not is_admin(user_id):
-        spend_coins(user_id, 1)
-    def mutate(data):
-        user = data["users"].get(str(user_id))
-        if user:
-            user["total_follows"] = user.get("total_follows", 0) + 1
-        return True
-    update_data(mutate)
-
-def load_accounts_from_file(filepath):
-    with open(filepath, 'r', encoding='utf-8') as f:
-        content = f.read()
-
-    content = re.sub(r',\s*}', '}', content)
-    content = re.sub(r',\s*]', ']', content)
-
-    try:
-        data = json.loads(content)
-    except json.JSONDecodeError:
-        return extract_accounts_regex(content)
-
-    accounts = []
-    if isinstance(data, list):
-        for item in data:
-            acc = extract_account_data(item)
-            if acc:
-                accounts.append(acc)
-    elif isinstance(data, dict):
-        for key in ['accounts', 'users', 'data', 'list']:
-            if key in data and isinstance(data[key], list):
-                for item in data[key]:
-                    acc = extract_account_data(item)
-                    if acc:
-                        accounts.append(acc)
-                if accounts:
-                    return accounts
-        acc = extract_account_data(data)
-        if acc:
-            accounts.append(acc)
-
-    if not accounts:
-        accounts = extract_accounts_regex(content)
-
-    return accounts
-
-def extract_account_data(obj):
-    if not isinstance(obj, dict):
-        return None
-
-    uid = None
-    password = None
-    jwt_token = None
-
-    uid_keys = ['uid', 'UID', 'userId', 'user_id', 'userid', 'id', 'account_id']
-    for key in uid_keys:
-        if key in obj and obj[key]:
-            uid = str(obj[key])
-            break
-
-    pwd_keys = ['password', 'pass', 'pwd', 'Password', 'PASSWORD']
-    for key in pwd_keys:
-        if key in obj and obj[key]:
-            password = str(obj[key])
-            break
-
-    token_keys = ['jwt_token', 'jwt', 'token', 'JWT', 'access_token', 'accessToken']
-    for key in token_keys:
-        if key in obj and obj[key]:
-            jwt_token = str(obj[key])
-            break
-
-    if uid:
-        account = {'uid': uid}
-        if password:
-            account['password'] = password
-        if jwt_token:
-            account['jwt_token'] = jwt_token
-        return account
-
-    return None
-
-def extract_accounts_regex(content):
-    accounts = []
-    pattern = r'["\']?uid["\']?\s*:\s*["\']?(\d+)["\']?.*?["\']?password["\']?\s*:\s*["\']([^"\']+)["\']'
-    matches = re.findall(pattern, content, re.IGNORECASE | re.DOTALL)
-    for uid, pwd in matches:
-        accounts.append({'uid': uid, 'password': pwd})
-    return accounts
-
-# ================= CORE FOLLOW FUNCTIONS =================
+# ══════════════════════════════════════════════════════════════
+# 🔐 CRYPTO + PROTOBUF — OPTIMIZED
+# ══════════════════════════════════════════════════════════════
 def encrypt_payload(data: bytes) -> bytes:
     cipher = AES.new(KEY, AES.MODE_CBC, IV)
     return cipher.encrypt(pad(data, AES.block_size))
 
-def get_jwt_token(uid, password):
-    url = f"{JWT_API}?uid={uid}&password={password}"
-
+def get_jwt(uid: str, password: str):
     try:
-        response = requests.get(url, timeout=15)
+        r = requests.get(f"{JWT_API}?uid={uid}&password={password}", timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            return (data.get("token") or data.get("jwt")
+                    or (data.get("data") or {}).get("token"))
+    except Exception:
+        pass
+    return None
 
-        if response.status_code == 200:
-            data = response.json()
-
-            if data.get("status") == "live" and data.get("token"):
-                token = data.get("token")
-                account_id = data.get("account_id", "N/A")
-                region = data.get("region", "N/A")
-                print(f"    ✓ Account ID: {account_id} | Region: {region}")
-                return token
-            elif data.get("token"):
-                return data.get("token")
-            elif data.get("jwt"):
-                return data.get("jwt")
-            elif data.get("data") and isinstance(data.get("data"), dict):
-                if data["data"].get("token"):
-                    return data["data"]["token"]
-            else:
-                print(f"    ✗ Invalid response format")
-                return None
-        else:
-            print(f"    ✗ API error: {response.status_code}")
-            return None
-
+def do_follow(target_id: int, jwt: str):
+    try:
+        req = follow_pb2.CSFollowReq()
+        req.target_id = target_id
+        encrypted = encrypt_payload(req.SerializeToString())
+        headers = {
+            "User-Agent": "UnityPlayer/2022.3.47f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+            "Accept": "*/*",
+            "Accept-Encoding": "deflate, gzip",
+            "Authorization": f"Bearer {jwt}",
+            "X-Ga": "v1 1",
+            "Releaseversion": "OB54",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Unity-Version": "2022.3.47f1",
+        }
+        resp = requests.post(FOLLOW_URL, headers=headers, data=encrypted, timeout=15)
+        if resp.status_code != 200:
+            return "http_error", {"status": resp.status_code, "text": resp.text[:120]}
+        res = follow_pb2.CSFollowRes()
+        res.ParseFromString(resp.content)
+        d = MessageToDict(res, preserving_proto_field_name=True)
+        return categorize(d), d
     except Exception as e:
-        print(f"    ✗ Exception: {e}")
+        return "exception", {"error": str(e)}
+
+def categorize(d: dict) -> str:
+    fi = d.get("fail_info", "")
+    if fi == "BR_WORKSHOP_FOLLOW_LIMIT_EXCEEDED":
+        return "limit"
+    if fi == "BR_WORKSHOP_ALREADY_FOLLOWED":
+        return "already"
+    if fi == "BR_WORKSHOP_ACCOUNT_NOT_FOUND":
+        return "not_found"
+    if "info" in d:
+        return "success"
+    return "other"
+
+def extract_capacity(d: dict) -> int:
+    cap = d.get("remaining_follow_capacity")
+    if cap is None:
+        cap = d.get("remaining_capacity")
+    if cap is None:
+        cs = d.get("creator_stats") or {}
+        cap = cs.get("remaining_follow_capacity")
+    if cap is None:
+        return None
+    try:
+        return int(cap)
+    except (TypeError, ValueError):
         return None
 
-def send_follow(target_id, jwt):
-    if follow_pb2 is None:
-        print("    ✗ follow_pb2 not available")
-        return False, "follow_pb2 missing"
-
+# ══════════════════════════════════════════════════════════════
+# 📦 ACCOUNT FILE PARSING — FAST
+# ══════════════════════════════════════════════════════════════
+def parse_accounts(content: str):
+    content = re.sub(r",\s*}", "}", content)
+    content = re.sub(r",\s*]", "]", content)
     try:
-        target_id_int = int(target_id)
-    except:
-        target_id_int = target_id
-
-    req = follow_pb2.CSFollowReq()
-    req.target_id = target_id_int
-    encrypted_data = encrypt_payload(req.SerializeToString())
-
-    headers = {
-        "User-Agent": "UnityPlayer/2022.3.47f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
-        "Accept": "*/*",
-        "Accept-Encoding": "deflate, gzip",
-        "Authorization": f"Bearer {jwt}",
-        "X-Ga": "v1 1",
-        "Releaseversion": "OB54",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "X-Unity-Version": "2022.3.47f1",
-    }
-
-    try:
-        response = requests.post(URL, headers=headers, data=encrypted_data, timeout=20)
-
-        if response.status_code == 200:
-            print(f"    ✓ Status: {response.status_code}")
-            try:
-                res = follow_pb2.CSFollowRes()
-                res.ParseFromString(response.content)
-                res_dict = MessageToDict(res, preserving_proto_field_name=True)
-                follower_count = res_dict.get('creator_stats', {}).get('follower_count', 'N/A')
-                print(f"    📊 Follower Count: {follower_count}")
-                return True, follower_count
-            except Exception as e:
-                print(f"    ⚠ Response received but could not decode: {e}")
-                return True, "Success"
-        elif response.status_code == 401:
-            print(f"    ✗ Status: {response.status_code} - Token Expired or Invalid")
-            return False, "Token expired"
-        else:
-            print(f"    ✗ Status: {response.status_code}")
-            return False, f"Status {response.status_code}"
-    except Exception as e:
-        print(f"    ✗ Error: {e}")
-        return False, str(e)
-
-# ================= PROGRESS BAR =================
-def create_progress_bar(current, total, width=20):
-    """Create a visual progress bar"""
-    if total == 0:
-        return "[" + "░" * width + "] 0%"
-
-    filled = int((current / total) * width)
-    bar = "█" * filled + "░" * (width - filled)
-    percentage = int((current / total) * 100)
-    return f"[{bar}] {percentage}%"
-
-# ================= TELEGRAM BOT =================
-class FollowBot:
-    def __init__(self, token):
-        self.token = token
-        self._last_edit = {}  # progress edit throttle
-        print("✅ Bot initialized")
-
-    async def update_progress(self, context, update_msg, target_id, current, total, stats, uid, final=False):
-        # Throttle edits (Telegram rate-limits editMessageText)
-        now = time.monotonic()
-        last = self._last_edit.get(update_msg.message_id, 0)
-        if not final and now - last < 0.4:
-            return
-        self._last_edit[update_msg.message_id] = now
-
-        # Follower counts captured from follow responses
-        before = stats.get('first_follower_count')
-        after = stats.get('last_follower_count')
-        if before is not None:
-            before_text = str(before - 1)   # count before our first follow
-            after_text = str(after) if after is not None else "N/A"
-        else:
-            before_text = "N/A"
-            after_text = "N/A"
-
-        bar = create_progress_bar(current, total)
-        if final:
-            text = (f"🔄 **Processing Complete!**\n\n"
-                    f"`{bar}`\n"
-                    f"📊 Progress: {current}/{total}\n"
-                    f"✅ Success: {stats['success']} | ❌ Failed: {stats['failed']}\n"
-                    f"👥 Before Followers: {before_text}\n"
-                    f"👥 After Followers: {after_text}")
-        else:
-            text = (f"🔄 **Processing follows for UID:** `{target_id}`\n\n"
-                    f"`{bar}`\n"
-                    f"📊 Progress: {current}/{total}\n"
-                    f"✅ Success: {stats['success']} | ❌ Failed: {stats['failed']}\n"
-                    f"👥 Before Followers: {before_text}\n"
-                    f"👥 After Followers: {after_text}\n"
-                    f"⏳ Current: `{uid}`")
-        try:
-            await context.bot.edit_message_text(
-                chat_id=update_msg.chat_id,
-                message_id=update_msg.message_id,
-                text=text,
-                parse_mode='Markdown'
-            )
-        except Exception:
-            pass
-
-    async def process_follows(self, target_id, accounts, user_id, update_msg=None, context=None):
-        """
-        Process follows with live progress.
-        Each call is fully isolated (own stats/results) -> safe for concurrent requests.
-        Blocking network calls run via asyncio.to_thread so the bot stays responsive.
-        """
-        stats = {
-            "total": len(accounts),
-            "success": 0,
-            "failed": 0,
-            "jwt_failed": 0,
-            "used_existing_tokens": 0,
-            "expired_tokens": 0,
-            "first_follower_count": None,   # after-count of first successful follow
-            "last_follower_count": None     # after-count of last successful follow
-        }
-
-        def track_count(info):
-            """Store follower count from a follow response"""
-            try:
-                c = int(info)
-            except (TypeError, ValueError):
-                return
-            if stats["first_follower_count"] is None:
-                stats["first_follower_count"] = c
-            stats["last_follower_count"] = c
-
-        results = []
-        total = len(accounts)
-
-        try:
-            delay = float(get_setting('follow_delay', 2) or 2)
-        except:
-            delay = 2
-
-        for i, acc in enumerate(accounts, 1):
-            uid = str(acc.get("uid", "Unknown"))
-            print(f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            print(f"  [{i}/{total}] Processing UID: {uid}")
-            print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-
-            # Update progress bar
-            if update_msg and context:
-                await self.update_progress(context, update_msg, target_id, i - 1, total, stats, uid)
-
-            jwt = acc.get('jwt_token')
-
-            if jwt:
-                print("  ✓ Using existing JWT token")
-                stats["used_existing_tokens"] += 1
-
-                print(f"  → Sending follow request to {target_id}...")
-                success, info = await asyncio.to_thread(send_follow, target_id, jwt)
-
-                if success:
-                    stats["success"] += 1
-                    track_count(info)
-                    results.append({"uid": uid, "status": "success", "account_uid": uid})
-                    record_success(user_id, uid, target_id)
-                else:
-                    stats["failed"] += 1
-                    password = acc.get("password", "")
-                    if password:
-                        print("  → Token may be expired. Trying to get new JWT...")
-                        new_jwt = await asyncio.to_thread(get_jwt_token, uid, password)
-                        if new_jwt:
-                            print("  ✓ New JWT obtained, retrying follow...")
-                            retry_success, retry_info = await asyncio.to_thread(send_follow, target_id, new_jwt)
-                            if retry_success:
-                                stats["success"] += 1
-                                stats["failed"] -= 1
-                                stats["expired_tokens"] += 1
-                                track_count(retry_info)
-                                results.append({"uid": uid, "status": "success", "account_uid": uid})
-                                record_success(user_id, uid, target_id)
-                            else:
-                                stats["expired_tokens"] += 1
-                                results.append({"uid": uid, "status": "failed", "account_uid": uid})
-                                mark_followed(uid, str(target_id), user_id, "failed")
-                        else:
-                            print("  ✗ Failed to get new JWT")
-                            stats["jwt_failed"] += 1
-                            results.append({"uid": uid, "status": "failed", "account_uid": uid})
-                            mark_followed(uid, str(target_id), user_id, "failed")
-                    else:
-                        results.append({"uid": uid, "status": "failed", "account_uid": uid})
-                        mark_followed(uid, str(target_id), user_id, "failed")
-            else:
-                password = acc.get("password", "")
-
-                if not password:
-                    print(f"  ✗ No password or JWT token found for UID: {uid}")
-                    stats["failed"] += 1
-                    stats["jwt_failed"] += 1
-                    results.append({"uid": uid, "status": "failed", "account_uid": uid})
-                    continue
-
-                print("  → Getting JWT token from API...")
-                jwt = await asyncio.to_thread(get_jwt_token, uid, password)
-
-                if not jwt:
-                    print(f"  ✗ Failed to get JWT for UID: {uid}")
-                    stats["jwt_failed"] += 1
-                    stats["failed"] += 1
-                    results.append({"uid": uid, "status": "failed", "account_uid": uid})
-                    continue
-
-                print("  ✓ JWT obtained successfully")
-                print(f"  → Sending follow request to {target_id}...")
-                success, info = await asyncio.to_thread(send_follow, target_id, jwt)
-
-                if success:
-                    stats["success"] += 1
-                    track_count(info)
-                    results.append({"uid": uid, "status": "success", "account_uid": uid})
-                    record_success(user_id, uid, target_id)
-                else:
-                    stats["failed"] += 1
-                    results.append({"uid": uid, "status": "failed", "account_uid": uid})
-                    mark_followed(uid, str(target_id), user_id, "failed")
-
-            # Small delay between follows to avoid rate limiting
-            if i < total and delay > 0:
-                await asyncio.sleep(delay)
-
-        # Final progress update
-        if update_msg and context:
-            await self.update_progress(context, update_msg, target_id, total, total, stats, "Done", final=True)
-
-        return stats, results
-
-# ================= TELEGRAM HANDLERS =================
-bot_instance = None
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    print(f"⚠️ Error: {context.error}")
-
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("✅ Cancelled!")
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_id = user.id
-
-    # Register user first (so referral bonus works immediately)
-    existing_user = get_user(user_id)
-    if not existing_user:
-        referred_by = None
-        if context.args and len(context.args) > 0:
-            ref_code = context.args[0]
-            referrer_id = get_user_by_referral_code(ref_code)
-            if referrer_id and referrer_id != user_id:
-                referred_by = referrer_id
-                try:
-                    await context.bot.send_message(
-                        chat_id=referrer_id,
-                        text=f"🎉 New referral! {user.first_name} joined using your link!\nYou earned +{get_setting('referral_coins', 5)} coins!"
-                    )
-                except:
-                    pass
-        add_user(user_id, user.username, user.first_name, user.last_name, referred_by=referred_by)
-        existing_user = get_user(user_id)
-
-    # Channel join gate
-    channels = get_channels()
-    if channels:
-        not_joined = []
-        for channel in channels:
-            if not await is_user_in_channel(user_id, context.bot, channel):
-                not_joined.append(channel)
-
-        if not_joined:
-            reply_markup = build_join_keyboard(not_joined)
-
-            await update.message.reply_text(
-                "⚠️ **Please Join Required Channels First!**\n\n"
-                "You need to join the following channels to use this bot:\n"
-                + "\n".join([f"• @{ch}" for ch in not_joined]),
-                reply_markup=reply_markup,
-                parse_mode='Markdown'
-            )
-            return
-
-    user_info = get_user_info(user_id)
-    referral_code = user_info["referral_code"] if user_info else f"ref_{user_id}"
-
-    is_admin_user = is_admin(user_id)
-    admin_text = " 👑 Admin" if is_admin_user else ""
-
-    keyboard = [
-        [InlineKeyboardButton("🎯 Follow Now", callback_data="follow")],
-        [InlineKeyboardButton("📊 My Stats", callback_data="stats")],
-        [InlineKeyboardButton("👥 Referrals", callback_data="referrals")],
-        [InlineKeyboardButton("ℹ️ Help", callback_data="help")],
-        [InlineKeyboardButton("🔗 My Referral Link", callback_data="referral_link")]
-    ]
-    # NOTE: Admin button REMOVED from user menu. Admins use /admin.
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    welcome_text = f"""👋 Welcome {user.first_name}!{admin_text}
-
-🎮 **Free Fire Follow Bot**
-
-🪙 You get {get_setting('daily_coins', 5)} free coins daily!
-1 coin = 1 follow
-
-👥 Refer friends to earn +{get_setting('referral_coins', 5)} coins each!
-
-🔗 Your Referral Link:
-`https://t.me/{context.bot.username}?start={referral_code}`
-"""
-
-    await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
-
-async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check if user joined channels after clicking button"""
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-    channels = get_channels()
-
-    not_joined = []
-    for channel in channels:
-        if not await is_user_in_channel(user_id, context.bot, channel):
-            not_joined.append(channel)
-
-    if not_joined:
-        reply_markup = build_join_keyboard(not_joined)
-
-        await query.edit_message_text(
-            "⚠️ **Please Join All Required Channels First!**\n\n"
-            "You still need to join:\n"
-            + "\n".join([f"• @{ch}" for ch in not_joined]),
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        return
-
-    # Make sure user is registered
-    user = query.from_user
-    if not get_user(user_id):
-        add_user(user_id, user.username, user.first_name, user.last_name)
-
-    user_info = get_user_info(user_id)
-    referral_code = user_info["referral_code"] if user_info else f"ref_{user_id}"
-
-    is_admin_user = is_admin(user_id)
-    admin_text = " 👑 Admin" if is_admin_user else ""
-
-    keyboard = [
-        [InlineKeyboardButton("🎯 Follow Now", callback_data="follow")],
-        [InlineKeyboardButton("📊 My Stats", callback_data="stats")],
-        [InlineKeyboardButton("👥 Referrals", callback_data="referrals")],
-        [InlineKeyboardButton("ℹ️ Help", callback_data="help")],
-        [InlineKeyboardButton("🔗 My Referral Link", callback_data="referral_link")]
-    ]
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    welcome_text = f"""👋 Welcome {user.first_name}!{admin_text}
-
-🎮 **Free Fire Follow Bot**
-
-🪙 You get {get_setting('daily_coins', 5)} free coins daily!
-1 coin = 1 follow
-
-👥 Refer friends to earn +{get_setting('referral_coins', 5)} coins each!
-
-🔗 Your Referral Link:
-`https://t.me/{context.bot.username}?start={referral_code}`
-"""
-
-    await query.edit_message_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data
-
-    if data == "follow":
-        await follow_command_callback(update, context)
-    elif data == "stats":
-        await stats_command_callback(update, context)
-    elif data == "referrals":
-        await referrals_command_callback(update, context)
-    elif data == "help":
-        await help_command_callback(update, context)
-    elif data == "referral_link":
-        await referral_link_command_callback(update, context)
-    elif data == "back_to_menu":
-        await back_to_menu(update, context)
-    elif data == "back_to_admin":
-        await admin_command_callback(update, context)
-    elif data == "check_join":
-        await check_join_callback(update, context)
-    elif data == "admin_command":
-        await admin_command_callback(update, context)
-    elif data.startswith("admin_"):
-        await admin_handler(update, context, data)
-    else:
-        # Unknown callback -> ignore gracefully
-        pass
-
-async def follow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /follow command from message"""
-    user_id = update.effective_user.id
-    message = update.effective_message
-
-    # Channel join check
-    channels = get_channels()
-    for channel in channels:
-        if not await is_user_in_channel(user_id, context.bot, channel):
-            await message.reply_text(
-                "⚠️ **Please Join Required Channels First!**",
-                reply_markup=build_join_keyboard(channels),
-                parse_mode='Markdown'
-            )
-            return
-
-    user = get_user(user_id)
-    if user and user.get("is_banned", False):
-        await message.reply_text("❌ You are banned!")
-        return
-
-    coins = get_available_coins(user_id)
-    if coins <= 0:
-        await message.reply_text("❌ You have 0 coins!\n\n🪙 Daily coins reset at midnight.\n👥 Or refer friends to earn +5 coins each!")
-        return
-
-    accounts = get_available_accounts()
-    if not accounts:
-        await message.reply_text("❌ No follower accounts available right now!\n\n⏳ Stock Over — wait for new stock. You'll be notified when new followers are added!")
-        return
-
-    keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    coins_text = "♾️ Unlimited" if is_admin(user_id) else str(coins)
-
-    msg = f"""🎯 Enter UID to follow
-
-🪙 Your Coins: {coins_text}
-💡 1 coin = 1 follow
-📌 Each account follows a UID only once
-
-Send UID (numbers only):"""
-
-    await message.reply_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
-    context.user_data['awaiting_target'] = True
-
-async def follow_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle follow button click"""
-    query = update.callback_query
-    user_id = query.from_user.id
-
-    # Channel join check
-    channels = get_channels()
-    for channel in channels:
-        if not await is_user_in_channel(user_id, context.bot, channel):
-            await query.edit_message_text(
-                "⚠️ **Please Join Required Channels First!**",
-                reply_markup=build_join_keyboard(channels),
-                parse_mode='Markdown'
-            )
-            return
-
-    user = get_user(user_id)
-    if user and user.get("is_banned", False):
-        await query.edit_message_text("❌ You are banned!")
-        return
-
-    coins = get_available_coins(user_id)
-    if coins <= 0:
-        await query.edit_message_text("❌ You have 0 coins!\n\n🪙 Daily coins reset at midnight.\n👥 Or refer friends to earn +5 coins each!")
-        return
-
-    accounts = get_available_accounts()
-    if not accounts:
-        await query.edit_message_text("❌ No follower accounts available right now!\n\n⏳ Stock Over — wait for new stock. You'll be notified when new followers are added!")
-        return
-
-    keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    coins_text = "♾️ Unlimited" if is_admin(user_id) else str(coins)
-
-    msg = f"""🎯 Enter UID to follow
-
-🪙 Your Coins: {coins_text}
-💡 1 coin = 1 follow
-📌 Each account follows a UID only once
-
-Send UID (numbers only):"""
-
-    await query.edit_message_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
-    context.user_data['awaiting_target'] = True
-
-# ---- MERGED TEXT MESSAGE DISPATCHER (only ONE text handler) ----
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-
-    # 1) Broadcast message
-    if context.user_data.get('awaiting_broadcast'):
-        context.user_data.pop('awaiting_broadcast', None)
-        if not is_admin(user_id):
-            await update.message.reply_text("❌ Unauthorized!")
-            return
-        await do_broadcast(update, context, text)
-        return
-
-    # 2) Add admin
-    if context.user_data.get('awaiting_add_admin'):
-        context.user_data.pop('awaiting_add_admin', None)
-        if not is_admin(user_id):
-            await update.message.reply_text("❌ Unauthorized!")
-            return
-        await do_add_admin(update, context, text)
-        return
-
-    # 3) Remove admin
-    if context.user_data.get('awaiting_remove_admin'):
-        context.user_data.pop('awaiting_remove_admin', None)
-        if not is_admin(user_id):
-            await update.message.reply_text("❌ Unauthorized!")
-            return
-        await do_remove_admin(update, context, text)
-        return
-
-    # 4) Add channel
-    if context.user_data.get('awaiting_add_channel'):
-        context.user_data.pop('awaiting_add_channel', None)
-        if not is_admin(user_id):
-            await update.message.reply_text("❌ Unauthorized!")
-            return
-        await do_add_channel(update, context, text)
-        return
-
-    # 5) Remove channel
-    if context.user_data.get('awaiting_remove_channel'):
-        context.user_data.pop('awaiting_remove_channel', None)
-        if not is_admin(user_id):
-            await update.message.reply_text("❌ Unauthorized!")
-            return
-        await do_remove_channel(update, context, text)
-        return
-
-    # 6) Settings change
-    if context.user_data.get('awaiting_setting'):
-        if not is_admin(user_id):
-            context.user_data.pop('awaiting_setting', None)
-            await update.message.reply_text("❌ Unauthorized!")
-            return
-        await do_setting(update, context, text)
-        return
-
-    # 7) Follow target UID
-    if context.user_data.get('awaiting_target'):
-        context.user_data.pop('awaiting_target', None)
-        if not text.isdigit():
-            await update.message.reply_text("❌ Invalid UID! Please enter numbers only.")
-            return
-        await process_follow(update, context, text)
-        return
-
-async def process_follow(update: Update, context: ContextTypes.DEFAULT_TYPE, target_uid: str):
-    user_id = update.effective_user.id
-
-    # Channel join check
-    channels = get_channels()
-    for channel in channels:
-        if not await is_user_in_channel(user_id, context.bot, channel):
-            await update.message.reply_text(
-                "⚠️ **Please Join Required Channels First!**",
-                reply_markup=build_join_keyboard(channels),
-                parse_mode='Markdown'
-            )
-            return
-
-    user = get_user(user_id)
-    if not user:
-        await update.message.reply_text("❌ Start bot first with /start")
-        return
-
-    if user.get("is_banned", False):
-        await update.message.reply_text("❌ You are banned!")
-        return
-
-    coins = get_available_coins(user_id)
-    if coins <= 0:
-        await update.message.reply_text("❌ You have 0 coins!\n\n🪙 Daily coins reset at midnight.\n👥 Or refer friends to earn +5 coins each!")
-        return
-
-    # ---- Stock logic: accounts that NEVER followed this target ----
-    all_accounts = get_available_accounts()
-    fresh_accounts = []
-    for acc in all_accounts:
-        if not is_target_followed_by_account(acc[0], target_uid):
-            fresh_accounts.append({
-                'uid': acc[0],
-                'password': acc[1],
-                'jwt_token': acc[2]
-            })
-
-    if not fresh_accounts:
-        await update.message.reply_text(
-            "❌ **Followers not available right now!**\n\n"
-            "⏳ **Stock Over** — all available follower accounts have already followed this UID.\n\n"
-            "📢 Wait for new stock. You'll be notified automatically when new follower accounts are added!"
-        )
-        return
-
-    # ---- Concurrency: reserve accounts not currently in use by another request ----
-    reserve_list = [(a['uid'], a['password'], a['jwt_token']) for a in fresh_accounts]
-    reserved = reserve_accounts(reserve_list)
-
-    if not reserved:
-        await update.message.reply_text(
-            "⏳ All follower accounts are busy right now. Please try again in a few seconds!"
-        )
-        return
-
-    try:
-        # Convert reserved tuples back to dicts
-        accounts_to_use = [
-            {'uid': r[0], 'password': r[1], 'jwt_token': r[2]}
-            for r in reserved[:min(coins, len(reserved))]
-        ]
-
-        stock_notice = ""
-        if len(reserved) < coins:
-            stock_notice = (f"\n⚠️ Stock limited: only {len(reserved)} follower accounts available "
-                            f"for this UID right now.\n📢 New stock coming soon!\n")
-
-        # Initial progress message with bar
-        bar = create_progress_bar(0, len(accounts_to_use))
-        msg = await update.message.reply_text(
-            f"🔄 **Processing follows for UID:** `{target_uid}`\n\n"
-            f"`{bar}`\n"
-            f"📊 Progress: 0/{len(accounts_to_use)}\n"
-            f"✅ Success: 0 | ❌ Failed: 0\n"
-            f"⏳ Starting...",
-            parse_mode='Markdown'
-        )
-
-        print(f"\n📌 Processing {len(accounts_to_use)} follows for user {user_id} to target {target_uid}")
-
-        # Process follows with live progress (async, non-blocking, concurrent-safe)
-        stats, results = await bot_instance.process_follows(target_uid, accounts_to_use, user_id, msg, context)
-
-        # Remaining coins after processing
-        remaining_coins = get_available_coins(user_id)
-        coins_disp = "♾️ Unlimited" if is_admin(user_id) else str(remaining_coins)
-
-        keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        success_count = stats["success"]
-        failed_count = stats["failed"]
-
-        await msg.edit_text(
-            f"✅ **Follow Request Complete!**\n\n"
-            f"🎯 Target: `{target_uid}`\n"
-            f"✅ Successful: {success_count}/{len(accounts_to_use)}\n"
-            f"❌ Failed: {failed_count}/{len(accounts_to_use)}\n"
-            f"🪙 Coins Left: {coins_disp}\n"
-            f"{stock_notice}"
-            f"\n💡 Use /follow to follow more!",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-    finally:
-        release_accounts(reserved)
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    message = update.effective_message
-
-    user = get_user(user_id)
-    if not user:
-        await message.reply_text("❌ Start bot first with /start")
-        return
-
-    await show_stats_message(message, user_id)
-
-async def stats_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-
-    user = get_user(user_id)
-    if not user:
-        await query.edit_message_text("❌ Start bot first with /start")
-        return
-
-    await show_stats_callback(query, user_id)
-
-async def show_stats_message(message, user_id):
-    user = get_user(user_id)
-    is_admin_user = is_admin(user_id)
-    referrals = get_referral_count(user_id)
-    coins, daily_granted, daily_limit = get_coins_info(user_id)
-
-    # Get total follows from history
-    data = load_data()
-    total_follows = 0
-    for entry in data["follow_history"]:
-        if entry["user_id"] == user_id and entry["status"] == "success":
-            total_follows += 1
-
-    keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    name = user.get("first_name") or user.get("username") or str(user_id)
-    joined = user.get("joined_date", "N/A")[:10] if user.get("joined_date") else "N/A"
-
-    if is_admin_user:
-        coins_text = "♾️ Unlimited"
-        daily_text = "♾️ Unlimited"
-    else:
-        coins_text = str(coins)
-        daily_text = f"{daily_granted}/{daily_limit} today"
-
-    await message.reply_text(
-        f"📊 **Your Stats**\n\n"
-        f"👤 {name}\n"
-        f"📅 Joined: {joined}\n"
-        f"👑 Admin: {'Yes' if is_admin_user else 'No'}\n\n"
-        f"🎯 Follow Stats:\n"
-        f"• Total: {total_follows}\n\n"
-        f"🪙 Coins: {coins_text}\n"
-        f"• Daily: {daily_text}\n"
-        f"👥 Referrals: {referrals}\n"
-        f"🔗 Code: `{user.get('referral_code', 'N/A')}`",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-
-async def show_stats_callback(query, user_id):
-    user = get_user(user_id)
-    is_admin_user = is_admin(user_id)
-    referrals = get_referral_count(user_id)
-    coins, daily_granted, daily_limit = get_coins_info(user_id)
-
-    # Get total follows from history
-    data = load_data()
-    total_follows = 0
-    for entry in data["follow_history"]:
-        if entry["user_id"] == user_id and entry["status"] == "success":
-            total_follows += 1
-
-    keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    name = user.get("first_name") or user.get("username") or str(user_id)
-    joined = user.get("joined_date", "N/A")[:10] if user.get("joined_date") else "N/A"
-
-    if is_admin_user:
-        coins_text = "♾️ Unlimited"
-        daily_text = "♾️ Unlimited"
-    else:
-        coins_text = str(coins)
-        daily_text = f"{daily_granted}/{daily_limit} today"
-
-    await query.edit_message_text(
-        f"📊 **Your Stats**\n\n"
-        f"👤 {name}\n"
-        f"📅 Joined: {joined}\n"
-        f"👑 Admin: {'Yes' if is_admin_user else 'No'}\n\n"
-        f"🎯 Follow Stats:\n"
-        f"• Total: {total_follows}\n\n"
-        f"🪙 Coins: {coins_text}\n"
-        f"• Daily: {daily_text}\n"
-        f"👥 Referrals: {referrals}\n"
-        f"🔗 Code: `{user.get('referral_code', 'N/A')}`",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-
-async def referral_link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    message = update.effective_message
-
-    user = get_user(user_id)
-    if not user:
-        await message.reply_text("❌ Start bot first with /start")
-        return
-
-    referral_code = user.get("referral_code", f"ref_{user_id}")
-
-    keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await message.reply_text(
-        f"🔗 **Your Referral Link**\n\n"
-        f"`https://t.me/{context.bot.username}?start={referral_code}`\n\n"
-        f"Each referral gives +{get_setting('referral_coins', 5)} coins!\n"
-        f"👥 Current referrals: {get_referral_count(user_id)}",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-
-async def referral_link_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-
-    user = get_user(user_id)
-    if not user:
-        await query.edit_message_text("❌ Start bot first with /start")
-        return
-
-    referral_code = user.get("referral_code", f"ref_{user_id}")
-
-    keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.edit_message_text(
-        f"🔗 **Your Referral Link**\n\n"
-        f"`https://t.me/{context.bot.username}?start={referral_code}`\n\n"
-        f"Each referral gives +{get_setting('referral_coins', 5)} coins!\n"
-        f"👥 Current referrals: {get_referral_count(user_id)}",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-
-async def referrals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    message = update.effective_message
-
-    user = get_user(user_id)
-    if not user:
-        await message.reply_text("❌ Start bot first with /start")
-        return
-
-    referred_users = get_referred_users(user_id)
-
-    keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    referral_code = user.get("referral_code", f"ref_{user_id}")
-
-    if not referred_users:
-        await message.reply_text(
-            f"👥 **Your Referrals**\n\n"
-            f"You haven't referred anyone yet!\n\n"
-            f"🔗 Your Referral Link:\n"
-            f"`https://t.me/{context.bot.username}?start={referral_code}`\n\n"
-            f"Share your link to earn +{get_setting('referral_coins', 5)} coins per referral!",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        return
-
-    ref_text = "👥 **Your Referrals**\n\n"
-    for ref in referred_users[:20]:
-        name = ref[1] or ref[2] or f"User {ref[0]}"
-        date = ref[3][:10] if ref[3] else 'N/A'
-        ref_text += f"• {name} - {date}\n"
-
-    ref_text += f"\n📊 Total: {len(referred_users)} referrals (+{len(referred_users) * get_setting('referral_coins', 5)} coins earned)\n\n"
-    ref_text += f"🔗 Your Referral Link:\n`https://t.me/{context.bot.username}?start={referral_code}`"
-
-    await message.reply_text(ref_text, reply_markup=reply_markup, parse_mode='Markdown')
-
-async def referrals_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-
-    user = get_user(user_id)
-    if not user:
-        await query.edit_message_text("❌ Start bot first with /start")
-        return
-
-    referred_users = get_referred_users(user_id)
-
-    keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    referral_code = user.get("referral_code", f"ref_{user_id}")
-
-    if not referred_users:
-        await query.edit_message_text(
-            f"👥 **Your Referrals**\n\n"
-            f"You haven't referred anyone yet!\n\n"
-            f"🔗 Your Referral Link:\n"
-            f"`https://t.me/{context.bot.username}?start={referral_code}`\n\n"
-            f"Share your link to earn +{get_setting('referral_coins', 5)} coins per referral!",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        return
-
-    ref_text = "👥 **Your Referrals**\n\n"
-    for ref in referred_users[:20]:
-        name = ref[1] or ref[2] or f"User {ref[0]}"
-        date = ref[3][:10] if ref[3] else 'N/A'
-        ref_text += f"• {name} - {date}\n"
-
-    ref_text += f"\n📊 Total: {len(referred_users)} referrals (+{len(referred_users) * get_setting('referral_coins', 5)} coins earned)\n\n"
-    ref_text += f"🔗 Your Referral Link:\n`https://t.me/{context.bot.username}?start={referral_code}`"
-
-    await query.edit_message_text(ref_text, reply_markup=reply_markup, parse_mode='Markdown')
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-
-    keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await message.reply_text(
-        f"""ℹ️ **Help**
-
-Commands:
-/start - Start bot
-/follow - Follow a user
-/stats - Your statistics
-/referrals - View referrals
-/help - This help
-/cancel - Cancel any pending action
-
-🪙 Coin system:
-• {get_setting('daily_coins', 5)} free coins daily (reset at midnight)
-• +{get_setting('referral_coins', 5)} coins per referral
-• 1 coin = 1 follow
-
-How to use:
-1. Click "Follow Now"
-2. Enter UID
-3. Bot follows using fresh accounts (each account follows a UID only once)
-
-📌 If stock runs out, you'll be notified when new follower accounts are added.""",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-
-async def help_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-
-    keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.edit_message_text(
-        f"""ℹ️ **Help**
-
-Commands:
-/start - Start bot
-/follow - Follow a user
-/stats - Your statistics
-/referrals - View referrals
-/help - This help
-/cancel - Cancel any pending action
-
-🪙 Coin system:
-• {get_setting('daily_coins', 5)} free coins daily (reset at midnight)
-• +{get_setting('referral_coins', 5)} coins per referral
-• 1 coin = 1 follow
-
-How to use:
-1. Click "Follow Now"
-2. Enter UID
-3. Bot follows using fresh accounts (each account follows a UID only once)
-
-📌 If stock runs out, you'll be notified when new follower accounts are added.""",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-
-async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    context.user_data.pop('awaiting_target', None)
-
-    keyboard = [
-        [InlineKeyboardButton("🎯 Follow Now", callback_data="follow")],
-        [InlineKeyboardButton("📊 My Stats", callback_data="stats")],
-        [InlineKeyboardButton("👥 Referrals", callback_data="referrals")],
-        [InlineKeyboardButton("ℹ️ Help", callback_data="help")],
-        [InlineKeyboardButton("🔗 My Referral Link", callback_data="referral_link")]
-    ]
-    # NOTE: Admin button REMOVED from user menu.
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.edit_message_text(
-        "🏠 **Main Menu**\n\nChoose an option:",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-
-# ================= ADMIN COMMANDS =================
-
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ Unauthorized!")
-        return
-
-    keyboard = [
-        [InlineKeyboardButton("📊 Dashboard", callback_data="admin_dashboard")],
-        [InlineKeyboardButton("📤 Upload Accounts", callback_data="admin_upload")],
-        [InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings")],
-        [InlineKeyboardButton("📈 Statistics", callback_data="admin_stats")],
-        [InlineKeyboardButton("📤 Export Data", callback_data="admin_export")],
-        [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("👑 Add Admin", callback_data="admin_add_admin")],
-        [InlineKeyboardButton("❌ Remove Admin", callback_data="admin_remove_admin")],
-        [InlineKeyboardButton("📋 Channel Management", callback_data="admin_channels")]
-    ]
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        f"🔐 **Admin Panel**\n\n"
-        f"Users: {get_total_users()}\n"
-        f"Accounts: {get_accounts_count()}\n"
-        f"Today: {get_today_follows()}\n"
-        f"Admins: {len(load_data().get('admins', []))}\n"
-        f"Channels: {len(load_data().get('channels', []))}",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-
-async def admin_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-
-    if not is_admin(user_id):
-        await query.edit_message_text("❌ Unauthorized!")
-        return
-
-    keyboard = [
-        [InlineKeyboardButton("📊 Dashboard", callback_data="admin_dashboard")],
-        [InlineKeyboardButton("📤 Upload Accounts", callback_data="admin_upload")],
-        [InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings")],
-        [InlineKeyboardButton("📈 Statistics", callback_data="admin_stats")],
-        [InlineKeyboardButton("📤 Export Data", callback_data="admin_export")],
-        [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("👑 Add Admin", callback_data="admin_add_admin")],
-        [InlineKeyboardButton("❌ Remove Admin", callback_data="admin_remove_admin")],
-        [InlineKeyboardButton("📋 Channel Management", callback_data="admin_channels")]
-    ]
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.edit_message_text(
-        f"🔐 **Admin Panel**\n\n"
-        f"Users: {get_total_users()}\n"
-        f"Accounts: {get_accounts_count()}\n"
-        f"Today: {get_today_follows()}\n"
-        f"Admins: {len(load_data().get('admins', []))}\n"
-        f"Channels: {len(load_data().get('channels', []))}",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-
-async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-
-    if not is_admin(user_id):
-        await query.edit_message_text("❌ Unauthorized!")
-        return
-
-    if data == "admin_dashboard":
-        await admin_dashboard(query)
-    elif data in ("admin_upload", "admin_upload_json"):
-        await admin_upload_prompt(query)
-    elif data == "admin_settings":
-        await admin_settings_menu(query)
-    elif data == "admin_stats":
-        await admin_stats_view(query)
-    elif data == "admin_export":
-        await admin_export_data(query)
-    elif data == "admin_broadcast":
-        await admin_broadcast_prompt(query, context)
-    elif data == "admin_add_admin":
-        await admin_add_admin_prompt(query, context)
-    elif data == "admin_remove_admin":
-        await admin_remove_admin_prompt(query, context)
-    elif data == "admin_channels":
-        await admin_channels_menu(query, context)
-    elif data == "admin_add_channel":
-        await admin_add_channel_prompt(query, context)
-    elif data == "admin_remove_channel":
-        await admin_remove_channel_prompt(query, context)
-    elif data == "admin_setting_daily":
-        await admin_setting_prompt(query, context, "daily_coins", "Daily Coins")
-    elif data == "admin_setting_referral":
-        await admin_setting_prompt(query, context, "referral_coins", "Referral Coins")
-    elif data == "admin_setting_delay":
-        await admin_setting_prompt(query, context, "follow_delay", "Follow Delay (seconds)")
-
-async def admin_dashboard(query):
-    data = load_data()
-    await query.edit_message_text(
-        f"📊 **Dashboard**\n\n"
-        f"📈 Stats:\n"
-        f"• Users: {get_total_users()}\n"
-        f"• Accounts: {get_accounts_count()}\n"
-        f"• Today: {get_today_follows()}\n"
-        f"• Admins: {len(data.get('admins', []))}\n"
-        f"• Channels: {len(data.get('channels', []))}\n\n"
-        f"⚙️ Settings:\n"
-        f"• Daily Coins: {get_setting('daily_coins', 5)}\n"
-        f"• Referral Coins: {get_setting('referral_coins', 5)}",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_to_admin")]]),
-        parse_mode='Markdown'
-    )
-
-async def admin_broadcast_prompt(query, context):
-    context.user_data['awaiting_broadcast'] = True
-    await query.edit_message_text(
-        "📢 **Broadcast Message**\n\n"
-        "Send me the message you want to broadcast to all users.\n\n"
-        "(Send /cancel to abort)",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_to_admin")]]),
-        parse_mode='Markdown'
-    )
-
-async def admin_add_admin_prompt(query, context):
-    context.user_data['awaiting_add_admin'] = True
-    await query.edit_message_text(
-        "👑 **Add Admin**\n\n"
-        "Send me the Telegram User ID of the user you want to make admin.\n\n"
-        "Example: `123456789`\n\n"
-        "(Send /cancel to abort)",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_to_admin")]]),
-        parse_mode='Markdown'
-    )
-
-async def admin_remove_admin_prompt(query, context):
-    context.user_data['awaiting_remove_admin'] = True
-    await query.edit_message_text(
-        "❌ **Remove Admin**\n\n"
-        "Send me the Telegram User ID of the admin you want to remove.\n\n"
-        "⚠️ Original admins (from ADMIN_IDS in config) are protected and cannot be removed.\n\n"
-        "(Send /cancel to abort)",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_to_admin")]]),
-        parse_mode='Markdown'
-    )
-
-async def admin_add_channel_prompt(query, context):
-    context.user_data['awaiting_add_channel'] = True
-    await query.edit_message_text(
-        "📋 **Add Channel / Group**\n\n"
-        "Send the channel link or username. Accepted formats:\n"
-        "• `https://t.me/my_channel`\n"
-        "• `t.me/my_channel`\n"
-        "• `@my_channel`\n"
-        "• `my_channel`\n"
-        "• numeric chat ID: `-1001234567890`\n\n"
-        "⚠️ The bot must be **admin** in the channel/group.\n"
-        "❌ Private invite links (`t.me/+xxxx`) are NOT supported.\n\n"
-        "(Send /cancel to abort)",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_to_admin")]]),
-        parse_mode='Markdown'
-    )
-
-async def admin_remove_channel_prompt(query, context):
-    context.user_data['awaiting_remove_channel'] = True
-    await query.edit_message_text(
-        "📋 **Remove Channel**\n\n"
-        "Send the channel username or link to remove.\n\n"
-        "Example: `my_channel` or `https://t.me/my_channel`\n\n"
-        "(Send /cancel to abort)",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_to_admin")]]),
-        parse_mode='Markdown'
-    )
-
-async def admin_setting_prompt(query, context, key, label):
-    context.user_data['awaiting_setting'] = key
-    await query.edit_message_text(
-        f"⚙️ **Set {label}**\n\n"
-        "Send the new value (positive number).\n\n"
-        "(Send /cancel to abort)",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_to_admin")]]),
-        parse_mode='Markdown'
-    )
-
-async def admin_channels_menu(query, context):
-    data = load_data()
-    channels = data.get('channels', [])
-
-    if channels:
-        channel_text = "📋 **Channel Management**\n\nCurrent channels:\n"
-        for i, channel in enumerate(channels, 1):
-            s = str(channel)
-            display = f"@{s.lstrip('@')}" if not s.lstrip('-').isdigit() else s
-            channel_text += f"{i}. {display}\n"
-        channel_text += f"\nTotal: {len(channels)} channel(s)"
-    else:
-        channel_text = "📋 **Channel Management**\n\nNo channels added yet."
-
-    keyboard = [
-        [InlineKeyboardButton("➕ Add Channel", callback_data="admin_add_channel")],
-        [InlineKeyboardButton("➖ Remove Channel", callback_data="admin_remove_channel")],
-        [InlineKeyboardButton("🔙 Back", callback_data="back_to_admin")]
-    ]
-    await query.edit_message_text(
-        channel_text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
-    )
-
-async def admin_upload_prompt(query):
-    keyboard = [
-        [InlineKeyboardButton("📄 Upload JSON", callback_data="admin_upload_json")],
-        [InlineKeyboardButton("🔙 Back", callback_data="back_to_admin")]
-    ]
-    await query.edit_message_text(
-        "📤 **Upload Accounts**\n\n"
-        "Send a **JSON file** to this chat.\n\n"
-        "Format:\n"
-        "```json\n"
-        "[\n"
-        "  {\n"
-        "    \"uid\": \"123456\",\n"
-        "    \"password\": \"pass\"\n"
-        "  }\n"
-        "]\n"
-        "```\n\n"
-        "✅ All users will be notified when new follower accounts are added!",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
-    )
-
-async def admin_settings_menu(query):
-    keyboard = [
-        [InlineKeyboardButton("🪙 Daily Coins", callback_data="admin_setting_daily")],
-        [InlineKeyboardButton("🎁 Referral Coins", callback_data="admin_setting_referral")],
-        [InlineKeyboardButton("⏱ Follow Delay", callback_data="admin_setting_delay")],
-        [InlineKeyboardButton("🔙 Back", callback_data="back_to_admin")]
-    ]
-    await query.edit_message_text(
-        f"⚙️ **Settings**\n\n"
-        f"• Daily Coins: {get_setting('daily_coins', 5)}\n"
-        f"• Referral Coins: {get_setting('referral_coins', 5)}\n"
-        f"• Follow Delay: {get_setting('follow_delay', 2)}s",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
-    )
-
-async def admin_stats_view(query):
-    data = load_data()
-    total = len(data["follow_history"])
-    success = len([e for e in data["follow_history"] if e["status"] == "success"])
-    rate = ((success / total) * 100) if total > 0 else 0
-
-    daily = {}
-    for entry in data["follow_history"]:
-        date = entry["follow_date"][:10]
-        daily[date] = daily.get(date, 0) + 1
-
-    text = f"📈 **Statistics**\n\nTotal: {total}\nSuccess: {success}\nRate: {rate:.1f}%\n\nLast 7 days:\n"
-    for date, count in sorted(daily.items(), reverse=True)[:7]:
-        text += f"• {date}: {count}\n"
-
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_to_admin")]]),
-        parse_mode='Markdown'
-    )
-
-async def admin_export_data(query):
-    data = load_data()
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        data = None
+
+    if isinstance(data, list) or isinstance(data, dict):
+        accounts, items = [], []
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            for k in ("accounts", "users", "data", "list"):
+                if k in data and isinstance(data[k], list):
+                    items = data[k]; break
+            if not items:
+                items = [data]
+        for obj in items:
+            acc = _extract(obj)
+            if acc:
+                accounts.append(acc)
+        if accounts:
+            return accounts
+
+    return _regex_accounts(content) or _line_accounts(content)
+
+def _extract(obj):
+    if not isinstance(obj, dict):
+        return None
+    uid = next((str(obj[k]) for k in ("uid", "UID", "userId", "user_id", "userid", "id", "account_id")
+                if obj.get(k)), None)
+    if not uid:
+        return None
+    pwd = next((str(obj[k]) for k in ("password", "pass", "pwd", "Password", "PASSWORD")
+                if obj.get(k)), None)
+    jwt = next((str(obj[k]) for k in ("jwt_token", "jwt", "token", "JWT", "access_token", "accessToken")
+                if obj.get(k)), None)
+    cap = next((int(obj[k]) for k in ("capacity", "cap", "remaining")
+                if obj.get(k) is not None and str(obj[k]).isdigit()), None)
+    acc = {"uid": uid}
+    if pwd: acc["password"] = pwd
+    if jwt: acc["jwt_token"] = jwt
+    if cap: acc["capacity"] = cap
+    return acc
+
+def _regex_accounts(content: str):
     accounts = []
-    for acc in data["accounts"]:
-        if acc.get("is_active", True):
-            accounts.append({
-                "uid": acc["uid"],
-                "password": acc["password"],
-                "jwt_token": acc.get("jwt_token")
-            })
+    pattern = r'["\']?uid["\']?\s*:\s*["\']?(\d+)["\']?.*?["\']?password["\']?\s*:\s*["\']([^"\']+)["\']'
+    for uid, pwd in re.findall(pattern, content, re.IGNORECASE | re.DOTALL):
+        accounts.append({"uid": uid, "password": pwd})
+    return accounts
 
-    if not accounts:
-        await query.edit_message_text("No accounts to export.")
-        return
+def _line_accounts(content: str):
+    accounts = []
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"^(\d+)\|([^|]+)(?:\|(\d+))?$", line)
+        if m:
+            acc = {"uid": m.group(1), "password": m.group(2).strip()}
+            if m.group(3):
+                acc["capacity"] = int(m.group(3))
+            accounts.append(acc)
+            continue
+        m = re.match(r"^(\d+)[:,\s]+(\S+)$", line)
+        if m:
+            accounts.append({"uid": m.group(1), "password": m.group(2)})
+    return accounts
 
-    filename = f"accounts_{int(time.time())}.json"
-    with open(filename, 'w', encoding='utf-8') as f:
-        json.dump(accounts, f, indent=2)
+def looks_like_accounts(text: str) -> bool:
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if lines:
+        pipe = sum(1 for ln in lines if re.match(r"^\d+\|.+$", ln))
+        if pipe and pipe >= max(1, int(len(lines) * 0.6)):
+            return True
+    low = text.lower()
+    if '"uid"' in low or "'uid'" in low or '"password"' in low or "'password'" in low:
+        return True
+    return False
 
+# ══════════════════════════════════════════════════════════════
+# 📢 CHANNEL MANAGEMENT — FAST
+# ══════════════════════════════════════════════════════════════
+def parse_channel_ref(text: str):
+    t = text.strip()
+    m = re.match(r"https?://t\.me/([A-Za-z0-9_+]+)", t)
+    if m:
+        ref = m.group(1)
+        if ref.startswith("+") or ref == "joinchat":
+            return f"https://t.me/{ref}", None
+        return f"https://t.me/{ref}", ref
+    m = re.match(r"^@([A-Za-z0-9_]+)$", t)
+    if m:
+        return f"https://t.me/{m.group(1)}", m.group(1)
+    if re.match(r"^-?\d+$", t):
+        return f"https://t.me/{t}", int(t)
+    if re.match(r"^[A-Za-z][A-Za-z0-9_]{3,}$", t):
+        return f"https://t.me/{t}", t
+    return None, None
+
+async def add_channel(bot, text: str):
+    link, chat_ref = parse_channel_ref(text)
+    if not link:
+        return None, ("Couldn't parse input.\nSend: `https://t.me/ChannelName`, "
+                      "`@ChannelName`, `ChannelName` or chat ID `-100xxxx`."), False
+    if chat_ref is None:
+        return None, ("Private invite links can't be verified. Add the bot as *admin* "
+                      "in the channel and send the channel *username* or *ID* instead."), False
+    api_ref = chat_ref if isinstance(chat_ref, int) else f"@{chat_ref}"
+    title = str(chat_ref)
+    chat_id_store = api_ref
     try:
-        with open(filename, 'rb') as f:
-            await query.message.reply_document(document=f, filename=filename)
-        await query.edit_message_text("✅ Export complete!")
-    except Exception as e:
-        await query.edit_message_text(f"❌ Export error: {e}")
-    finally:
-        if os.path.exists(filename):
-            os.remove(filename)
+        chat = await bot.get_chat(api_ref)
+        title = chat.title or chat.username or str(chat.id)
+        chat_id_store = chat.id
+        if chat.username:
+            link = f"https://t.me/{chat.username}"
+    except Exception:
+        pass
+    existing = await _run(channels_coll.find_one, {"chat_id": str(chat_id_store)})
+    if existing:
+        return existing, None, True
+    doc = {
+        "chat_id": str(chat_id_store),
+        "link": link,
+        "title": title,
+        "added_at": datetime.utcnow(),
+    }
+    await _run(channels_coll.insert_one, doc)
+    return doc, None, False
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+async def not_joined_channels(bot, user_id: int) -> list:
+    out = []
+    channels = await _run(lambda: list(channels_coll.find({})))
+    for ch in channels:
+        chat_ref = ch.get("chat_id")
+        if not chat_ref:
+            continue
+        try:
+            chat_ref = int(chat_ref) if str(chat_ref).lstrip("-").isdigit() else chat_ref
+            m = await bot.get_chat_member(chat_ref, user_id)
+            if m.status in ("member", "administrator", "creator"):
+                continue
+            out.append(ch)
+        except Exception:
+            continue
+    return out
 
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ Unauthorized!")
+def join_prompt_text(missing: list) -> str:
+    names = "\n".join(f"🔸 {ch.get('title') or ch.get('chat_id')}" for ch in missing)
+    return (f"{box('🔒 JOIN REQUIRED')}\n"
+            f"To use the bot, you must join our channel(s) first:\n\n"
+            f"{names}\n\n"
+            f"Join and tap *✅ I've Joined* below.")
+
+def join_kb(missing: list) -> InlineKeyboardMarkup:
+    kb = [[InlineKeyboardButton(f"🔗 Join {ch.get('title') or ch.get('chat_id')}", url=ch["link"])]
+          for ch in missing if ch.get("link")]
+    kb.append([B("✅ I've Joined", "check_joined")])
+    return InlineKeyboardMarkup(kb)
+
+async def join_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    uid = update.effective_user.id
+    if is_admin(uid):
+        return True
+    missing = await not_joined_channels(context.bot, uid)
+    if missing:
+        await update.message.reply_text(join_prompt_text(missing),
+                                        parse_mode=ParseMode.MARKDOWN,
+                                        reply_markup=join_kb(missing))
+        return False
+    return True
+
+def channels_text() -> str:
+    chs = list(channels_coll.find({}))
+    txt = f"{box('📢 CHANNEL MGMT')}\n"
+    if not chs:
+        txt += "No channels added yet.\nUsers are NOT forced to join."
+    else:
+        for i, ch in enumerate(chs, 1):
+            txt += f"{i}. {ch.get('title')} — {ch.get('link')}\n"
+    txt += (f"\n{THIN}\n📡 Total: *{len(chs)}* channel(s)\n\n"
+            f"⚠️ Bot must be *admin* in each channel\n"
+            f"to verify memberships.")
+    return txt
+
+def channels_kb() -> InlineKeyboardMarkup:
+    kb = []
+    for ch in channels_coll.find({}):
+        kb.append([B(f"❌ {ch.get('title')}", f"remove_channel_{ch['_id']}")])
+    kb.append([B("➕ Add Channel", "action_add_channel")])
+    kb.append([B("⬅️ Back", "menu_admin")])
+    return InlineKeyboardMarkup(kb)
+
+# ══════════════════════════════════════════════════════════════
+# 🧵 ACTIVE JOBS / CANCEL
+# ══════════════════════════════════════════════════════════════
+active_tasks = {}
+cancel_flags = {}
+
+def is_cancelled(uid: int) -> bool:
+    return cancel_flags.get(uid, False)
+
+# ══════════════════════════════════════════════════════════════
+# 🔔 ADMIN NOTIFICATION — FAST
+# ══════════════════════════════════════════════════════════════
+async def notify_admin_limit_reached(context: ContextTypes.DEFAULT_TYPE, uid: str, 
+                                     target_id: int, response_data: dict):
+    acc = await _run(accounts_coll.find_one, {"uid": uid})
+    if not acc:
         return
-
-    document = update.message.document
-    if not document.file_name.endswith('.json'):
-        await update.message.reply_text("❌ Upload JSON file!")
-        return
-
-    file = await context.bot.get_file(document.file_id)
-    file_path = f"temp_{int(time.time())}_{uuid.uuid4().hex[:6]}.json"
-    await file.download_to_drive(file_path)
-
-    try:
-        accounts = load_accounts_from_file(file_path)
-
-        if not accounts:
-            await update.message.reply_text("❌ No valid accounts found in file!")
-            return
-
-        added = 0
-        for acc in accounts:
-            uid = acc.get('uid')
-            password = acc.get('password')
-            jwt_token = acc.get('jwt_token')
-
-            if uid and password:
-                if add_account(uid, password, jwt_token, added_by=user_id):
-                    added += 1
-
-        await update.message.reply_text(
-            f"✅ **Upload Complete!**\n\n"
-            f"Added: {added} accounts\n"
-            f"Total accounts: {get_accounts_count()}"
-        )
-
-        # Notify users in a BACKGROUND task so the bot never freezes on upload
-        if added > 0:
-            context.application.create_task(notify_new_stock(context, added))
-
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
-    finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-
-async def notify_new_stock(context, count):
-    """Notify all users that new follower accounts were added (runs in background)"""
-    data = load_data()
-    users = list(data["users"].keys())
-
-    sent = 0
-    for user_id_str in users:
+    
+    password = acc.get("password", "N/A")
+    capacity = acc.get("capacity", "N/A")
+    
+    error_doc = {
+        "uid": uid,
+        "error_type": "FOLLOW_LIMIT_EXCEEDED",
+        "error_detail": "Account reached follow limit",
+        "response_data": response_data,
+        "target_id": target_id,
+        "at": datetime.utcnow(),
+        "resolved": False
+    }
+    await _run(error_logs_coll.insert_one, error_doc)
+    
+    notification = (
+        f"{box('🚨 FOLLOW LIMIT REACHED')}\n"
+        f"⚠️ *Account:* `{uid}`\n"
+        f"🎯 *Target:* `{target_id}`\n"
+        f"🔑 *Password:* `{password}`\n"
+        f"⚡ *Capacity:* `{capacity}`\n"
+        f"📝 *Status:* Account can no longer follow anyone\n\n"
+        f"{THIN}\n"
+        f"🕐 *Time:* {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    )
+    
+    kb = InlineKeyboardMarkup([
+        [B("🗑️ Delete Account", f"admin_delete_acc_{uid}")],
+        [B("🔄 Restock Account", f"admin_restock_acc_{uid}")],
+        [B("📋 View Response", f"admin_view_error_{uid}")]
+    ])
+    
+    admins = get_all_admins()
+    for admin_id in admins:
         try:
             await context.bot.send_message(
-                chat_id=int(user_id_str),
-                text=f"🆕 **New Followers Added!**\n\n"
-                     f"✅ {count} new follower account(s) are now available!\n\n"
-                     f"🎯 Click **Follow Now** to boost your follows!\n"
-                     f"🪙 1 coin = 1 follow",
-                parse_mode='Markdown'
+                admin_id,
+                notification,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb
             )
-            sent += 1
         except Exception:
             pass
-        await asyncio.sleep(0.05)  # avoid Telegram flood limits
 
-    print(f"📢 New-stock notification sent to {sent} users")
+# ══════════════════════════════════════════════════════════════
+# 🚀 ULTRA FAST FOLLOW ENGINE
+# ══════════════════════════════════════════════════════════════
+async def run_follow_job(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                         target_id: int, budget: int, is_admin_user: bool):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    budget_txt = "∞" if is_admin_user else str(budget)
 
-# ================= ACTION HELPERS (used by merged text dispatcher) =================
+    msg = await context.bot.send_message(
+        chat_id,
+        f"🚀 *Follow job started*\n🎯 Target: `{target_id}`\n"
+        f"🪙 Budget: {budget_txt}\n"
+        f"⚡ *Processing...*",
+        parse_mode=ParseMode.MARKDOWN)
 
-async def do_broadcast(update, context, message):
-    data = load_data()
-    users = list(data["users"].keys())
-
-    if not users:
-        await update.message.reply_text("📭 No users to broadcast to yet.")
-        return
-
-    status = await update.message.reply_text(f"📢 Broadcasting to {len(users)} users...\n⏳ This may take a while.")
-
-    sent = 0
-    failed = 0
-
-    for user_id_str in users:
+    async def show(text: str):
+        nonlocal msg
         try:
-            await context.bot.send_message(
-                chat_id=int(user_id_str),
-                text=f"📢 Announcement\n\n{message}"
-            )
-            sent += 1
-        except Exception:
-            failed += 1
-
-        if (sent + failed) % 20 == 0:
+            await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+        except BadRequest:
             try:
-                await status.edit_text(f"📢 Broadcasting... {sent + failed}/{len(users)}")
+                await msg.edit_text(text)
+            except Exception:
+                msg = await context.bot.send_message(chat_id, text)
+        except Exception:
+            msg = await context.bot.send_message(chat_id, text)
+
+    C = {"done": 0, "skipped": 0, "failed": 0, "limit_reached": 0, "extra": 0}
+    used_uids = []
+    seen = set()
+
+    accounts = await _run(
+        lambda: list(accounts_coll.find({"status": "active"}).sort("capacity", -1).limit(30000)))
+
+    async def process_one(acc):
+        try:
+            if is_cancelled(user_id):
+                return None
+            uid = acc["uid"]
+            if uid in seen:
+                return None
+            seen.add(uid)
+
+            await asyncio.sleep(FOLLOW_DELAY)
+
+            jwt = acc.get("jwt_token") or ""
+            if not jwt:
+                jwt = await _run(get_jwt, uid, acc.get("password", ""))
+                if jwt:
+                    await _run(accounts_coll.update_one,
+                               {"uid": uid}, {"$set": {"jwt_token": jwt}})
+                else:
+                    await _run(accounts_coll.update_one,
+                               {"uid": uid}, {"$inc": {"fails": 1}})
+                    return ("failed", uid, "JWT fail", None, None, None)
+
+            cat, d = await _run(do_follow, target_id, jwt)
+            
+            server_cap = extract_capacity(d)
+            
+            cstat = d.get("creator_stats") or {}
+            follower_after = int(cstat.get("follower_count", 0)) if cstat else 0
+            follower_before = max(follower_after - 1, 0)
+            
+            if server_cap is not None:
+                await _run(accounts_coll.update_one,
+                           {"uid": uid}, {"$set": {"capacity": server_cap}})
+
+            if cat == "success":
+                info = d.get("info", {})
+                await _run(accounts_coll.update_one,
+                           {"uid": uid},
+                           {"$set": {"last_used": datetime.utcnow(), "jwt_token": jwt},
+                            "$inc": {"successes": 1}})
+                return ("done", uid, info.get("nickname", "?"), server_cap or acc.get("capacity", MAX_CAP), 
+                       follower_before, follower_after)
+            
+            elif cat == "already":
+                await _run(accounts_coll.update_one,
+                           {"uid": uid}, {"$inc": {"skips": 1}})
+                return ("skipped", uid, None, None, None, None)
+            
+            elif cat == "limit":
+                await _run(accounts_coll.update_one,
+                           {"uid": uid}, {"$set": {"status": "limit_reached"}, "$inc": {"fails": 1}})
+                await notify_admin_limit_reached(context, uid, target_id, d)
+                return ("limit_reached", uid, None, None, None, None)
+            
+            elif cat == "not_found":
+                await _run(accounts_coll.update_one,
+                           {"uid": uid}, {"$inc": {"fails": 1}})
+                return ("failed", uid, "not found", None, None, None)
+            
+            else:
+                await _run(accounts_coll.update_one,
+                           {"uid": uid}, {"$inc": {"fails": 1}})
+                err = str(d.get("fail_info") or d.get("error") or "Unknown")[:40]
+                return ("failed", uid, err, None, None, None)
+                
+        except Exception as e:
+            logger.warning("process_one error uid=%s: %s", acc.get("uid"), e)
+            await _run(accounts_coll.update_one,
+                       {"uid": str(acc.get("uid", "?"))}, {"$inc": {"fails": 1}})
+            return ("failed", str(acc.get("uid", "?")), "internal", None, None, None)
+
+    def batcher(items, size):
+        for i in range(0, len(items), size):
+            yield items[i:i + size]
+
+    for batch in batcher(accounts, BATCH_SIZE):
+        if is_cancelled(user_id):
+            break
+        results = await asyncio.gather(*(process_one(a) for a in batch))
+
+        lines = []
+        for r in results:
+            if not r:
+                continue
+            kind = r[0]
+            if kind == "done":
+                if C["done"] >= budget and not is_admin_user:
+                    C["extra"] += 1
+                    continue
+                _, uid, nick, cap, before, after = r
+                C["done"] += 1
+                used_uids.append(uid)
+                if not is_admin_user:
+                    await _run(spend_coin, user_id)
+                lines.append(f"✅ `{uid}` {E(nick)} — 👥 {before}→{after} (+{after - before}) ⚡{cap}")
+            elif kind == "skipped":
+                C["skipped"] += 1
+                lines.append(f"⏭️ `{r[1]}` already followed")
+            elif kind == "limit_reached":
+                C["limit_reached"] += 1
+                lines.append(f"🚨 `{r[1]}` limit reached - admin notified")
+            else:
+                C["failed"] += 1
+                lines.append(f"❌ `{r[1]}` {r[2]}")
+
+        bar = "▰" * min(C["done"], 12) + "▱" * max(12 - min(C["done"], 12), 0)
+        await show(f"{THIN}\n🎯 `{target_id}`  {bar} {C['done']}/{budget_txt}\n{THIN}\n"
+                   + "\n".join(lines[-6:]) + f"\n{THIN}\n"
+                   f"✅{C['done']} ⏭️{C['skipped']} ❌{C['failed']} 🚨{C['limit_reached']}")
+
+        if not is_admin_user and C["done"] >= budget:
+            break
+
+    if is_admin_user:
+        final = (f"✅ *Admin job complete!*\n🎯 `{target_id}`\n"
+                 f"✅ Followed: {C['done']} | ⏭️ Skipped: {C['skipped']}\n"
+                 f"❌ Failed: {C['failed']} | 🚨 Limit reached: {C['limit_reached']}\n"
+                 f"♾️ Unlimited — no coins deducted.")
+    elif is_cancelled(user_id):
+        final = (f"⛔ *Task cancelled.*\nPartial: ✅{C['done']} ⏭️{C['skipped']} ❌{C['failed']}\n"
+                 f"🪙 {C['done']} coin{'s' if C['done'] != 1 else ''} deducted.")
+    elif C["done"] >= budget:
+        bonus = (f"\n🎁 Bonus: {C['extra']} extra free follower{'s' if C['extra'] != 1 else ''}"
+                 if C["extra"] else "")
+        final = (f"🎉 *Job Complete!*\nAll {budget} followers delivered to `{target_id}`.\n"
+                 f"✅{C['done']} ⏭️{C['skipped']} ❌{C['failed']} 🚨{C['limit_reached']}\n"
+                 f"🪙 {budget} coins deducted.{bonus}")
+    elif C["done"] == 0:
+        final = (f"😔 *STOCK OVER*\nNo successful follows for `{target_id}`.\n"
+                 f"⏭️ {C['skipped']} | ❌ {C['failed']} | 🚨 {C['limit_reached']}\n\n"
+                 f"✅ No coins were deducted.")
+    else:
+        final = (f"⚠️ *Partial run* — {C['done']}/{budget_txt} done, stock exhausted.\n"
+                 f"✅{C['done']} ⏭️{C['skipped']} ❌{C['failed']} 🚨{C['limit_reached']}\n"
+                 f"🪙 {C['done']} coin{'s' if C['done'] != 1 else ''} deducted.")
+
+    if C['limit_reached'] > 0:
+        final += f"\n\n⚠️ *{C['limit_reached']} accounts reached limit.* Admins notified."
+
+    final += f"\n{THIN}\n✨ *TITAN EDITION*"
+    await show(final)
+
+    await _run(log_coll.insert_one, {
+        "user": user_id, "target": target_id, "done": C["done"],
+        "skipped": C["skipped"], "failed": C["failed"], "limit_reached": C["limit_reached"],
+        "accounts_used": used_uids, "at": datetime.utcnow(),
+    })
+
+# ══════════════════════════════════════════════════════════════
+# 🧭 MENU BUILDERS
+# ══════════════════════════════════════════════════════════════
+def main_kb(user_id: int) -> InlineKeyboardMarkup:
+    kb = [
+        [B("👤 My Profile", "menu_profile"), B("🪙 Coins", "menu_coins"), B("👥 Refer", "menu_refer")],
+        [B("📖 Help", "menu_help"), B("🚀 Follow", "menu_follow")],
+        [B("🏆 Leaderboard", "menu_leaderboard")],
+    ]
+    if is_admin(user_id):
+        kb.append([B("⚙️ Admin Panel", "menu_admin")])
+    return InlineKeyboardMarkup(kb)
+
+def admin_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [B("📦 Stock", "menu_stock"), B("📜 Logs", "menu_logs")],
+        [B("⚠️ Error Logs", "menu_error_logs")],
+        [B("➕ Add Coins", "action_addcoin"), B("➖ Remove Coins", "action_removecoin")],
+        [B("🚫 Ban User", "action_ban"), B("✅ Unban User", "action_unban")],
+        [B("👑 Add Admin", "action_add_admin"), B("👑 Remove Admin", "action_remove_admin")],
+        [B("📢 Broadcast", "action_broadcast"), B("📤 Upload Accounts", "action_upload")],
+        [B("📢 Channels", "menu_channels"), B("⚙️ Settings", "menu_settings")],
+        [B("⬅️ Back", "menu_main")],
+    ])
+
+def main_menu_text(user) -> str:
+    cfg = get_settings()
+    return (f"{box('🏠 MAIN MENU')}\n"
+            f"👋 Welcome back!\n\n"
+            f"🪙 Daily coins: *{user['daily_coins']}* / {cfg['daily_coins']}\n"
+            f"🎁 Referral coins: *{user['referral_coins']}*\n"
+            f"📊 Available: *{available_coins(user)}*\n\n"
+            f"👇 Choose an option:")
+
+# ══════════════════════════════════════════════════════════════
+# 🏆 LEADERBOARD
+# ══════════════════════════════════════════════════════════════
+def _top_users(start: datetime, limit: int = 5):
+    follows = log_coll.aggregate([
+        {"$match": {"at": {"$gte": start}}},
+        {"$group": {"_id": "$user", "follows": {"$sum": "$done"}}},
+    ])
+    refs = referral_logs.aggregate([
+        {"$match": {"at": {"$gte": start}}},
+        {"$group": {"_id": "$ref_by", "refs": {"$sum": 1}}},
+    ])
+    fm = {d["_id"]: d["follows"] for d in follows}
+    rm = {d["_id"]: d["refs"] for d in refs}
+    rows = []
+    for i in set(fm) | set(rm):
+        f = int(fm.get(i, 0))
+        r = int(rm.get(i, 0))
+        rows.append({"uid": i, "follows": f, "refs": r, "score": f + r})
+    rows.sort(key=lambda x: (-x["score"], -x["follows"]))
+    return rows[:limit]
+
+def _display_name(uid: int) -> str:
+    u = users_coll.find_one({"_id": uid}, {"username": 1, "first_name": 1})
+    if not u:
+        return f"`{uid}`"
+    if u.get("username"):
+        return f"`@{u['username']}`"
+    return f"`{u.get('first_name') or uid}`"
+
+def leaderboard_text() -> str:
+    now = datetime.utcnow()
+    day_start  = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = now - timedelta(days=7)
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+    lines = [f"{box('🏆 LEADERBOARD')}",
+             f"⚡ Score = ✅ successful follows + 👥 successful referrals"]
+    today = _top_users(day_start)
+    lines.append(f"\n📅 *TODAY* — top 5")
+    if today:
+        for i, r in enumerate(today):
+            lines.append(f"{medals[i]} {_display_name(r['uid'])}\n"
+                         f"     ✅ {r['follows']} follows · 👥 {r['refs']} refs")
+    else:
+        lines.append("No activity yet — be the first! 🚀")
+    week = _top_users(week_start)
+    lines.append(f"\n📆 *LAST 7 DAYS* — top 5")
+    if week:
+        for i, r in enumerate(week):
+            lines.append(f"{medals[i]} {_display_name(r['uid'])}\n"
+                         f"     ✅ {r['follows']} follows · 👥 {r['refs']} refs")
+    else:
+        lines.append("No activity in the last 7 days.")
+    lines.append(f"\n{THIN}\n✨ *TITAN EDITION*")
+    return "\n".join(lines)
+
+# ══════════════════════════════════════════════════════════════
+# 🏠 USER COMMANDS — ALL DEFINED
+# ══════════════════════════════════════════════════════════════
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    uname = update.effective_user.username or ""
+    fname = update.effective_user.first_name or ""
+    args = context.args
+    cfg = get_settings()
+
+    ref_by = None
+    if args and args[0].startswith("ref_"):
+        try:
+            ref_by = int(args[0].split("_")[1])
+        except (ValueError, IndexError):
+            ref_by = None
+
+    user = await _run(get_user_sync, uid, uname, fname)
+
+    if ref_by and ref_by != uid:
+        ref_user = await _run(users_coll.find_one, {"_id": ref_by})
+        if ref_user and uid not in ref_user.get("referred_users", []):
+            await _run(users_coll.update_one,
+                {"_id": ref_by},
+                {"$inc": {"referral_coins": cfg["ref_coins"], "total_earned": cfg["ref_coins"]},
+                 "$push": {"referred_users": uid}})
+            await _run(users_coll.update_one, {"_id": uid}, {"$set": {"referred_by": ref_by}})
+            try:
+                await _run(referral_logs.insert_one, {
+                    "ref_by": ref_by, "ref_user": uid,
+                    "username": uname, "first_name": fname,
+                    "at": datetime.utcnow(),
+                })
+            except Exception:
+                pass
+            try:
+                updated = await _run(users_coll.find_one, {"_id": ref_by})
+                if uname:
+                    display = f"`@{uname}`"
+                elif fname:
+                    display = f"`{fname}`"
+                else:
+                    display = f"`{uid}`"
+                kb = InlineKeyboardMarkup([[B("🏆 Leaderboard", "menu_leaderboard")]])
+                await context.bot.send_message(
+                    ref_by,
+                    f"🎉 *New Referral!*\n\n👤 {display} joined via your link!\n🪙 +{cfg['ref_coins']} coins!",
+                    parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
             except Exception:
                 pass
 
-        await asyncio.sleep(0.05)
+    user = await _run(get_user_sync, uid, uname, fname)
+    txt = (f"{box('🔥 FF CARFT LAND')}\n"
+           f"👋 Hey *{fname}*!\n"
+           f"🪙 Coins: *{available_coins(user)}* ({cfg['daily_coins']} daily + {cfg['ref_coins']} per referral)\n\n"
+           f"⚡ *How it works:*\n"
+           f"1️⃣ `/follow <UID>` — 1 coin per successful follower\n"
+           f"2️⃣ Daily {cfg['daily_coins']} coins reset at midnight if unused\n"
+           f"3️⃣ Referral coins never expire\n"
+           f"4️⃣ Compete on the 🏆 leaderboard — top 5 daily & weekly!\n\n"
+           f"💰 Share & earn: `https://t.me/{BOT_USERNAME}?start=ref_{uid}`")
 
-    try:
-        await status.edit_text(
-            f"✅ **Broadcast Complete!**\n\n📤 Sent: {sent}\n❌ Failed: {failed}",
-            parse_mode='Markdown'
-        )
-    except Exception:
-        await status.edit_text(f"✅ Broadcast Complete!\n\nSent: {sent}\nFailed: {failed}")
+    missing = await not_joined_channels(context.bot, uid)
+    if missing and not is_admin(uid):
+        await update.message.reply_text(txt + "\n\n" + join_prompt_text(missing),
+                                        parse_mode=ParseMode.MARKDOWN,
+                                        reply_markup=join_kb(missing))
+        return
+    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN,
+                                    reply_markup=main_kb(uid))
 
-async def do_add_admin(update, context, text):
-    try:
-        new_admin_id = int(text.strip())
-    except ValueError:
-        await update.message.reply_text("❌ Invalid User ID! Send numbers only.")
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await join_gate(update, context):
+        return
+    txt = (f"{box('📖 HELP')}\n"
+           f"👤 *User*\n"
+           f"`/start` — home menu\n`/follow <UID>` — follow target (1 coin each)\n"
+           f"`/profile` — my stats\n`/refer` — referral link\n"
+           f"`/leaderboard` — 🏆 top 5 today & last 7 days\n"
+           f"`/cancel` — stop job\n\n"
+           f"🛡️ *Admin*\n"
+           f"`/admin` — panel\n`/addcoin <id> <n>` · `/removecoin <id> <n>`\n"
+           f"`/ban <id>` · `/unban <id>` · `/stock` · `/logs`\n"
+           f"`/broadcast <text>` · `/upload` (then send file)\n\n"
+           f"⚡ Admins follow unlimited & free.\n"
+           f"✨ *TITAN EDITION*")
+    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
+
+async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await join_gate(update, context):
+        return
+    user = await _run(get_user_sync, update.effective_user.id)
+    uid = update.effective_user.id
+    cfg = get_settings()
+    txt = (f"{box('👤 MY PROFILE')}\n"
+           f"🆔 ID: `{uid}`\n"
+           f"🪙 Daily: *{user['daily_coins']}* / {cfg['daily_coins']}\n"
+           f"🎁 Referral: *{user['referral_coins']}*\n"
+           f"📊 Available: *{available_coins(user)}*\n"
+           f"💸 Spent: *{user['total_spent']}*\n"
+           f"👥 Referrals: *{len(user.get('referred_users', []))}*\n"
+           f"🔄 Reset: `{user['last_daily_reset']}`")
+    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
+
+async def cmd_refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await join_gate(update, context):
+        return
+    uid = update.effective_user.id
+    cfg = get_settings()
+    txt = (f"{box('👥 REFER & EARN')}\n"
+           f"Earn *{cfg['ref_coins']} coins* per friend who joins:\n\n"
+           f"🔗 `https://t.me/{BOT_USERNAME}?start=ref_{uid}`\n\n"
+           f"Friends get {cfg['daily_coins']} free daily coins too! 🎁\n"
+           f"🏆 Every referral also boosts your leaderboard score!")
+    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
+
+async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await join_gate(update, context):
+        return
+    txt = await _run(leaderboard_text)
+    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN,
+                                    reply_markup=back_kb())
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    cancel_flags[uid] = True
+    context.user_data.pop("awaiting", None)
+    context.user_data.pop("broadcast_waiting", None)
+    context.user_data.pop("upload_waiting", None)
+    if uid in active_tasks and not active_tasks[uid].done():
+        await update.message.reply_text("⛔ *Cancelling job…*", parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text("ℹ️ Nothing to cancel.", parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_follow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = await _run(get_user_sync, uid)
+
+    if user.get("banned"):
+        await update.message.reply_text("🚫 *Banned.*", parse_mode=ParseMode.MARKDOWN)
+        return
+    if not await join_gate(update, context):
+        return
+    if uid in active_tasks and not active_tasks[uid].done():
+        await update.message.reply_text("⏳ *Job running!* Use /cancel.", parse_mode=ParseMode.MARKDOWN)
         return
 
-    if add_admin(new_admin_id):
-        await update.message.reply_text(f"✅ User `{new_admin_id}` is now an admin!")
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("❌ `/follow <UID>`", parse_mode=ParseMode.MARKDOWN)
+        return
+    target_id = int(args[0])
+
+    admin = is_admin(uid)
+    budget = 10**9 if admin else available_coins(user)
+    if not admin and budget <= 0:
+        kb = InlineKeyboardMarkup([[B("👥 Refer & Earn", "menu_refer")]])
+        await update.message.reply_text("🪙 *No coins!* Use referral.", parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        return
+
+    active = accounts_coll.count_documents({"status": "active"})
+    if active == 0:
+        await update.message.reply_text("📦 *No stock.* Contact admin.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    cancel_flags[uid] = False
+    task = asyncio.create_task(run_follow_job(update, context, target_id, budget, admin))
+    active_tasks[uid] = task
+
+# ══════════════════════════════════════════════════════════════
+# 🛡️ ADMIN COMMANDS
+# ══════════════════════════════════════════════════════════════
+def require_admin(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("🚫 *Admin only!*", parse_mode=ParseMode.MARKDOWN)
+            return
+        return await func(update, context)
+    return wrapper
+
+def stock_text() -> str:
+    total  = accounts_coll.count_documents({})
+    active = accounts_coll.count_documents({"status": "active"})
+    limit_reached = accounts_coll.count_documents({"status": "limit_reached"})
+    users  = users_coll.count_documents({})
+    agg = accounts_coll.aggregate([
+        {"$match": {"status": "active"}},
+        {"$group": {"_id": None, "cap": {"$sum": "$capacity"}}}])
+    total_cap = next((a["cap"] for a in agg), 0)
+    txt = (f"{box('📦 STOCK')}\n"
+           f"📦 Total: *{total}* | ✅ Active: *{active}* | 🚨 Limit reached: *{limit_reached}*\n"
+           f"👥 Users: *{users}* | ⚡ Total capacity: *{total_cap}*\n"
+           f"{THIN}\n")
+    rows = []
+    for a in accounts_coll.find({}).sort("capacity", -1).limit(50):
+        icon = "🚨" if a.get("status") == "limit_reached" else "✅"
+        rows.append(f"{icon} `{a['uid']}`\n"
+                    f"    ⚡ {a.get('capacity', 0)} | ✅ {a.get('successes', 0)} | ❌ {a.get('fails', 0)}")
+    txt += "\n".join(rows) if rows else "No accounts."
+    if total > 50:
+        txt += f"\n{THIN}\n⚠️ Showing 50 of {total}."
+    return txt
+
+def logs_text() -> str:
+    logs = log_coll.find().sort("at", -1).limit(10)
+    lines = [f"👤 `{l['user']}` → 🎯 `{l['target']}`\n   ✅{l['done']} ⏭️{l['skipped']} ❌{l['failed']} 🚨{l.get('limit_reached', 0)} @ {l['at'].strftime('%m-%d %H:%M')}"
+             for l in logs]
+    return f"{box('📜 RECENT JOBS')}\n" + ("\n".join(lines) if lines else "No jobs.")
+
+def error_logs_text() -> str:
+    errors = error_logs_coll.find().sort("at", -1).limit(20)
+    lines = []
+    for e in errors:
+        status = "✅" if e.get("resolved", False) else "🚨"
+        lines.append(f"{status} `{e['uid']}` — {e['error_type']}\n"
+                     f"   📝 {e['error_detail'][:50]}… @ {e['at'].strftime('%m-%d %H:%M')}")
+    return f"{box('⚠️ ERROR LOGS')}\n" + ("\n".join(lines) if lines else "No errors.")
+
+async def do_text_broadcast(context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    sent = 0
+    user_ids = await _run(lambda: [u["_id"] for u in users_coll.find({}, {"_id": 1})])
+    for uid_ in user_ids:
         try:
-            await context.bot.send_message(
-                chat_id=new_admin_id,
-                text="👑 You have been promoted to Admin!\n\nYou now have access to the admin panel (use /admin) and unlimited coins."
-            )
+            await context.bot.send_message(uid_, f"📢 *Broadcast*\n\n{text}",
+                                           parse_mode=ParseMode.MARKDOWN)
+            sent += 1
         except Exception:
             pass
-    else:
-        await update.message.reply_text("❌ User is already an admin!")
+        await asyncio.sleep(0.05)
+    return sent
 
-async def do_remove_admin(update, context, text):
+async def broadcast_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    sent = 0
+    user_ids = await _run(lambda: [u["_id"] for u in users_coll.find({}, {"_id": 1})])
+    for uid_ in user_ids:
+        try:
+            await update.message.copy(uid_)
+            sent += 1
+        except Exception:
+            pass
+        await asyncio.sleep(0.05)
+    return sent
+
+async def notify_stock_update(context: ContextTypes.DEFAULT_TYPE, new: int) -> int:
+    if new <= 0:
+        return 0
+    sent = 0
+    user_ids = await _run(lambda: [u["_id"] for u in users_coll.find({}, {"_id": 1})])
+    for uid_ in user_ids:
+        try:
+            await context.bot.send_message(
+                uid_,
+                f"📦 *NEW STOCK!*\n🎉 *{new}* fresh accounts added!\n🚀 `/follow <UID>`",
+                parse_mode=ParseMode.MARKDOWN)
+            sent += 1
+        except Exception:
+            pass
+        await asyncio.sleep(0.05)
+    return sent
+
+def store_accounts_sync(content: str):
+    accounts = parse_accounts(content)
+    new = dup = err = 0
+    for acc in accounts:
+        try:
+            accounts_coll.insert_one({
+                "uid": acc["uid"],
+                "password": acc.get("password", ""),
+                "jwt_token": acc.get("jwt_token", ""),
+                "capacity": acc.get("capacity", MAX_CAP),
+                "status": "active",
+                "successes": 0, "skips": 0, "fails": 0,
+                "last_used": None,
+            })
+            new += 1
+        except DuplicateKeyError:
+            dup += 1
+        except Exception as e:
+            err += 1
+            logger.warning("account insert error: %s", e)
+    return new, dup, err
+
+async def store_accounts(content: str):
+    return await _run(store_accounts_sync, content)
+
+@require_admin
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"{box('⚙️ ADMIN PANEL')}\nChoose:",
+                                    reply_markup=admin_kb())
+
+@require_admin
+async def cmd_addcoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    a = context.args
+    if len(a) < 2 or not a[0].isdigit() or not a[1].isdigit():
+        await update.message.reply_text("❌ `/addcoin <id> <amount>`", parse_mode=ParseMode.MARKDOWN)
+        return
+    tid, amt = int(a[0]), int(a[1])
+    await _run(get_user_sync, tid)
+    await _run(users_coll.update_one, {"_id": tid}, {"$inc": {"referral_coins": amt, "total_earned": amt}})
+    await update.message.reply_text(f"✅ Added *{amt}* coins to `{tid}`", parse_mode=ParseMode.MARKDOWN)
+
+@require_admin
+async def cmd_removecoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    a = context.args
+    if len(a) < 2 or not a[0].isdigit() or not a[1].isdigit():
+        await update.message.reply_text("❌ `/removecoin <id> <amount>`", parse_mode=ParseMode.MARKDOWN)
+        return
+    tid, amt = int(a[0]), int(a[1])
+    await _run(get_user_sync, tid)
+    await _run(users_coll.update_one, {"_id": tid}, {"$inc": {"referral_coins": -amt}})
+    await update.message.reply_text(f"➖ Removed *{amt}* coins from `{tid}`", parse_mode=ParseMode.MARKDOWN)
+
+@require_admin
+async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("❌ `/ban <id>`", parse_mode=ParseMode.MARKDOWN)
+        return
+    tid = int(context.args[0])
+    await _run(get_user_sync, tid)
+    await _run(users_coll.update_one, {"_id": tid}, {"$set": {"banned": True}})
+    await update.message.reply_text(f"🚫 Banned `{tid}`", parse_mode=ParseMode.MARKDOWN)
+
+@require_admin
+async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("❌ `/unban <id>`", parse_mode=ParseMode.MARKDOWN)
+        return
+    tid = int(context.args[0])
+    await _run(get_user_sync, tid)
+    await _run(users_coll.update_one, {"_id": tid}, {"$set": {"banned": False}})
+    await update.message.reply_text(f"✅ Unbanned `{tid}`", parse_mode=ParseMode.MARKDOWN)
+
+@require_admin
+async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = await _run(stock_text)
+    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
+
+@require_admin
+async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = await _run(logs_text)
+    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
+
+@require_admin
+async def cmd_error_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = await _run(error_logs_text)
+    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
+
+@require_admin
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args:
+        sent = await do_text_broadcast(context, " ".join(context.args))
+        await update.message.reply_text(f"📢 Sent to *{sent}* users.", parse_mode=ParseMode.MARKDOWN)
+        return
+    context.user_data["broadcast_waiting"] = True
+    await update.message.reply_text(
+        "📢 *Broadcast armed!*\nSend message/file.\n`/cancel` to abort.",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
+
+@require_admin
+async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["upload_waiting"] = True
+    await update.message.reply_text(
+        "📤 *Upload mode ready!*\nSend accounts file or paste text.\n`/cancel` to abort.",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
+
+# ══════════════════════════════════════════════════════════════
+# 🖱️ CALLBACKS
+# ══════════════════════════════════════════════════════════════
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
     try:
-        remove_id = int(text.strip())
-    except ValueError:
-        await update.message.reply_text("❌ Invalid User ID! Send numbers only.")
+        await q.answer()
+    except BadRequest:
+        pass
+    data, uid = q.data, q.from_user.id
+    ud = context.user_data
+    user = await _run(get_user_sync, uid)
+
+    # Admin Error Actions
+    if data.startswith("admin_delete_acc_"):
+        if not is_admin(uid):
+            await q.edit_message_text("🚫 Admin only!", parse_mode=ParseMode.MARKDOWN)
+            return
+        acc_uid = data.replace("admin_delete_acc_", "")
+        result = await _run(accounts_coll.delete_one, {"uid": acc_uid})
+        await _run(error_logs_coll.update_one, {"uid": acc_uid}, {"$set": {"resolved": True}})
+        if result.deleted_count > 0:
+            await q.edit_message_text(f"🗑️ *Deleted*\n`{acc_uid}` removed.", parse_mode=ParseMode.MARKDOWN)
+        else:
+            await q.edit_message_text(f"❌ `{acc_uid}` not found.", parse_mode=ParseMode.MARKDOWN)
         return
 
-    if remove_admin(remove_id):
-        await update.message.reply_text(f"✅ User `{remove_id}` is no longer an admin!")
-    else:
-        await update.message.reply_text("❌ User is not an admin or cannot be removed (original admins are protected).")
+    elif data.startswith("admin_restock_acc_"):
+        if not is_admin(uid):
+            await q.edit_message_text("🚫 Admin only!", parse_mode=ParseMode.MARKDOWN)
+            return
+        acc_uid = data.replace("admin_restock_acc_", "")
+        result = await _run(accounts_coll.update_one,
+                           {"uid": acc_uid},
+                           {"$set": {"capacity": MAX_CAP, "fails": 0, "status": "active"}})
+        await _run(error_logs_coll.update_one, {"uid": acc_uid}, {"$set": {"resolved": True}})
+        if result.modified_count > 0:
+            await q.edit_message_text(f"🔄 *Restocked*\n`{acc_uid}` reset to {MAX_CAP}.",
+                parse_mode=ParseMode.MARKDOWN)
+        else:
+            await q.edit_message_text(f"❌ `{acc_uid}` not found.", parse_mode=ParseMode.MARKDOWN)
+        return
 
-async def do_add_channel(update, context, text):
-    """Add channel/group accepting full links, @username, plain username or numeric ID"""
-    identifier, kind = parse_channel_identifier(text)
+    elif data.startswith("admin_view_error_"):
+        if not is_admin(uid):
+            await q.edit_message_text("🚫 Admin only!", parse_mode=ParseMode.MARKDOWN)
+            return
+        acc_uid = data.replace("admin_view_error_", "")
+        error = await _run(error_logs_coll.find_one, {"uid": acc_uid}, sort=[("at", -1)])
+        if error:
+            response_data = error.get("response_data", {})
+            full_response = json.dumps(response_data, indent=2)[:3000]
+            text = (f"📋 *Full Response*\n🔑 `{acc_uid}`\n{THIN}\n```json\n{full_response}\n```")
+            await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await q.edit_message_text(f"❌ No error for `{acc_uid}`", parse_mode=ParseMode.MARKDOWN)
+        return
 
-    if kind == 'private':
+    # Regular Menu Callbacks
+    if data != "check_joined" and not is_admin(uid):
+        missing = await not_joined_channels(context.bot, uid)
+        if missing:
+            await safe_edit(q, join_prompt_text(missing), parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=join_kb(missing))
+            return
+
+    if data == "menu_main":
+        await safe_edit(q, main_menu_text(user), parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=main_kb(uid))
+    elif data == "menu_profile":
+        cfg = get_settings()
+        await safe_edit(q,
+            f"{box('👤 PROFILE')}\n🪙 Daily: *{user['daily_coins']}*/{cfg['daily_coins']}\n"
+            f"🎁 Referral: *{user['referral_coins']}*\n📊 Available: *{available_coins(user)}*",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
+    elif data == "menu_coins":
+        cfg = get_settings()
+        await safe_edit(q,
+            f"{box('🪙 COINS')}\n🪙 Daily: *{user['daily_coins']}*/{cfg['daily_coins']}\n"
+            f"🎁 Referral: *{user['referral_coins']}*\n📊 Available: *{available_coins(user)}*",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
+    elif data == "menu_refer":
+        cfg = get_settings()
+        await safe_edit(q,
+            f"{box('👥 REFER')}\n🔗 `https://t.me/{BOT_USERNAME}?start=ref_{uid}`\n\n🎁 +{cfg['ref_coins']} 🪙/friend!",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
+    elif data == "menu_help":
+        await safe_edit(q,
+            f"{box('📖 HELP')}\n`/follow <UID>` — 1 coin/follower\n"
+            f"`/profile` · `/refer` · `/leaderboard` · `/cancel`",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
+    elif data == "menu_follow":
+        await safe_edit(q,
+            f"{box('🚀 FOLLOW')}\n`/follow <TARGET_UID>`\nExample: `/follow 7733108466`",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
+    elif data == "menu_leaderboard":
+        txt = await _run(leaderboard_text)
+        await safe_edit(q, txt, parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
+    elif data == "check_joined":
+        missing = await not_joined_channels(context.bot, uid)
+        if missing:
+            await safe_edit(q, join_prompt_text(missing), parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=join_kb(missing))
+        else:
+            await safe_edit(q, main_menu_text(user), parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=main_kb(uid))
+    elif data == "menu_admin" and is_admin(uid):
+        await safe_edit(q, f"{box('⚙️ ADMIN')}\nChoose:", reply_markup=admin_kb())
+    elif data == "menu_error_logs" and is_admin(uid):
+        txt = await _run(error_logs_text)
+        await safe_edit(q, txt, parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
+    elif data == "menu_settings" and is_admin(uid):
+        cfg = get_settings()
+        await safe_edit(q,
+            f"{box('⚙️ SETTINGS')}\n🪙 Daily: *{cfg['daily_coins']}*\n🎁 Refer: *{cfg['ref_coins']}*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [B("🪙 Set Daily", "action_set_daily")],
+                [B("🎁 Set Refer", "action_set_ref")],
+                [B("⬅️ Back", "menu_admin")],
+            ]))
+    elif data == "menu_stock" and is_admin(uid):
+        txt = await _run(stock_text)
+        await safe_edit(q, txt, parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
+    elif data == "menu_logs" and is_admin(uid):
+        txt = await _run(logs_text)
+        await safe_edit(q, txt, parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
+    elif data == "menu_channels" and is_admin(uid):
+        txt = await _run(channels_text)
+        await safe_edit(q, txt, parse_mode=ParseMode.MARKDOWN, reply_markup=channels_kb())
+    elif data.startswith("remove_channel_") and is_admin(uid):
+        oid = data[len("remove_channel_"):]
+        try:
+            ch = await _run(channels_coll.find_one_and_delete, {"_id": ObjectId(oid)})
+        except Exception:
+            ch = None
+        if ch:
+            out = f"🗑️ Removed: `{ch.get('title')}`\n\n{await _run(channels_text)}"
+        else:
+            out = f"❌ Not found.\n\n{await _run(channels_text)}"
+        await safe_edit(q, out, parse_mode=ParseMode.MARKDOWN, reply_markup=channels_kb())
+    elif data.startswith("action_") and is_admin(uid):
+        if data in ("action_broadcast", "action_upload", "action_add_admin", "action_remove_admin"):
+            ud.pop("awaiting", None)
+            if data == "action_broadcast":
+                ud["broadcast_waiting"] = True
+                title, hint = "📢 Broadcast", "Send message/file."
+            elif data == "action_upload":
+                ud["upload_waiting"] = True
+                title, hint = "📤 Upload", "Send accounts file/text."
+            elif data == "action_add_admin":
+                ud["awaiting"] = "action_add_admin"
+                title, hint = "👑 Add Admin", "Send user ID: `123456789`"
+            else:
+                ud["awaiting"] = "action_remove_admin"
+                title, hint = "👑 Remove Admin", "Send user ID: `123456789`"
+            kb = InlineKeyboardMarkup([[B("⬅️ Back", "clear_state")]])
+            await safe_edit(q, f"{box(title)}\n{hint}", parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=kb)
+            return
+        ud["awaiting"] = data
+        cfg = get_settings()
+        hints = {
+            "action_addcoin": ("➕ Add Coins", "Send: `<id> <amount>`"),
+            "action_removecoin": ("➖ Remove Coins", "Send: `<id> <amount>`"),
+            "action_ban": ("🚫 Ban", "Send: `<id>`"),
+            "action_unban": ("✅ Unban", "Send: `<id>`"),
+            "action_set_daily": ("🪙 Set Daily", f"Send: `<amount>` Current: {cfg['daily_coins']}"),
+            "action_set_ref": ("🎁 Set Refer", f"Send: `<amount>` Current: {cfg['ref_coins']}"),
+            "action_add_channel": ("📢 Add Channel", "Send: `@channel` or link"),
+        }
+        title, hint = hints.get(data, ("⚙️ Admin", "Send input."))
+        kb = InlineKeyboardMarkup([[B("⬅️ Back", "clear_state")]])
+        await safe_edit(q, f"{box(title)}\n{hint}", parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=kb)
+    elif data == "clear_state":
+        ud.pop("awaiting", None)
+        ud.pop("broadcast_waiting", None)
+        ud.pop("upload_waiting", None)
+        await safe_edit(q, main_menu_text(user), parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=main_kb(uid))
+
+# ══════════════════════════════════════════════════════════════
+# 📨 MESSAGE / MEDIA HANDLERS
+# ══════════════════════════════════════════════════════════════
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None or update.effective_user is None:
+        return
+    uid = update.effective_user.id
+    ud = context.user_data
+    text = update.message.text or ""
+
+    if ud.get("broadcast_waiting"):
+        if not is_admin(uid):
+            return
+        ud["broadcast_waiting"] = False
+        sent = await do_text_broadcast(context, text)
+        await update.message.reply_text(f"📢 Sent to *{sent}* users.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if ud.get("upload_waiting"):
+        if not is_admin(uid):
+            return
+        ud["upload_waiting"] = False
+        new, dup, err = await store_accounts(text)
+        notified = await notify_stock_update(context, new) if new > 0 else 0
         await update.message.reply_text(
-            "❌ Private invite links (`t.me/+xxxx`) are NOT supported.\n\n"
-            "Please add the bot as admin in the channel/group and send the public username "
-            "(e.g. `https://t.me/my_channel` or `@my_channel`) or the numeric chat ID."
-        )
+            f"📦 *Upload complete*\n✅ New: {new} | ⏭️ Dup: {dup} | ❌ Err: {err}"
+            + (f"\n📢 Notified *{notified}* users!" if notified else ""),
+            parse_mode=ParseMode.MARKDOWN)
         return
 
-    if not identifier:
-        await update.message.reply_text("❌ Invalid channel link/name!")
+    awaiting = ud.get("awaiting")
+    if awaiting and is_admin(uid):
+        valid = ("action_addcoin", "action_removecoin", "action_ban",
+                 "action_unban", "action_set_daily", "action_set_ref",
+                 "action_add_channel", "action_add_admin", "action_remove_admin")
+        if awaiting not in valid:
+            ud.pop("awaiting", None)
+            await update.message.reply_text("ℹ️ Stale action cleared.", reply_markup=admin_kb())
+            return
+        parts = text.strip().split()
+        try:
+            if awaiting == "action_addcoin":
+                tid, amt = int(parts[0]), int(parts[1])
+                await _run(get_user_sync, tid)
+                await _run(users_coll.update_one, {"_id": tid}, {"$inc": {"referral_coins": amt, "total_earned": amt}})
+                out = f"✅ Added *{amt}* coins to `{tid}`"
+            elif awaiting == "action_removecoin":
+                tid, amt = int(parts[0]), int(parts[1])
+                await _run(get_user_sync, tid)
+                await _run(users_coll.update_one, {"_id": tid}, {"$inc": {"referral_coins": -amt}})
+                out = f"➖ Removed *{amt}* coins from `{tid}`"
+            elif awaiting == "action_ban":
+                tid = int(parts[0])
+                await _run(get_user_sync, tid)
+                await _run(users_coll.update_one, {"_id": tid}, {"$set": {"banned": True}})
+                out = f"🚫 Banned `{tid}`"
+            elif awaiting == "action_unban":
+                tid = int(parts[0])
+                await _run(get_user_sync, tid)
+                await _run(users_coll.update_one, {"_id": tid}, {"$set": {"banned": False}})
+                out = f"✅ Unbanned `{tid}`"
+            elif awaiting == "action_add_admin":
+                tid = int(parts[0])
+                if add_admin(tid):
+                    out = f"👑 Added `{tid}` as admin!"
+                else:
+                    out = f"❌ Failed to add `{tid}`."
+            elif awaiting == "action_remove_admin":
+                tid = int(parts[0])
+                if remove_admin(tid):
+                    out = f"👑 Removed `{tid}` from admins."
+                else:
+                    out = f"❌ `{tid}` was not an admin."
+            elif awaiting == "action_set_daily":
+                val = int(parts[0])
+                if val < 0:
+                    out = "❌ Can't be negative."
+                else:
+                    set_setting("daily_coins", val)
+                    out = f"🪙 Daily coins set to *{val}*"
+            elif awaiting == "action_set_ref":
+                val = int(parts[0])
+                if val < 0:
+                    out = "❌ Can't be negative."
+                else:
+                    set_setting("ref_coins", val)
+                    out = f"🎁 Referral coins set to *{val}*"
+            else:
+                doc, err, existed = await add_channel(context.bot, text)
+                if err:
+                    out = f"❌ {err}"
+                elif existed:
+                    out = f"ℹ️ Channel already added: `{doc.get('title')}`"
+                else:
+                    out = f"✅ *Channel added!*\n📢 `{doc.get('title')}`"
+        except (ValueError, IndexError):
+            out = "❌ *Invalid format.*"
+        ud.pop("awaiting", None)
+        await update.message.reply_text(out, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_kb())
         return
 
-    # Validate the bot can actually access this chat
-    try:
-        cid = identifier if identifier.lstrip('-').isdigit() else "@" + identifier.lstrip('@')
-        chat = await context.bot.get_chat(chat_id=cid)
-        chat_title = chat.title or identifier
-    except Exception:
+    if is_admin(uid) and looks_like_accounts(text):
+        new, dup, err = await store_accounts(text)
+        notified = await notify_stock_update(context, new) if new > 0 else 0
         await update.message.reply_text(
-            f"❌ Cannot access `{identifier}`.\n\n"
-            f"Make sure the bot is **added as admin** in the channel/group first.",
-            parse_mode='Markdown'
-        )
+            f"📦 *Uploaded*\n✅ New: {new} | ⏭️ Dup: {dup} | ❌ Err: {err}"
+            + (f"\n📢 Notified *{notified}* users!" if notified else ""),
+            parse_mode=ParseMode.MARKDOWN)
         return
 
-    if add_channel(identifier):
-        await update.message.reply_text(
-            f"✅ Channel `{chat_title}` added!\n\n"
-            f"📌 Users must join `@{identifier}` to use the bot.",
-            parse_mode='Markdown'
-        )
-    else:
-        await update.message.reply_text("❌ Channel already exists!")
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None or update.effective_user is None:
+        return
+    uid = update.effective_user.id
+    ud = context.user_data
 
-async def do_remove_channel(update, context, text):
-    identifier, kind = parse_channel_identifier(text)
-    if kind == 'private' or not identifier:
-        await update.message.reply_text("❌ Invalid channel link/name!")
+    if update.message.text:
         return
 
-    if remove_channel(identifier):
-        await update.message.reply_text(f"✅ Channel `{identifier}` removed!")
-    else:
-        await update.message.reply_text("❌ Channel not found!")
-
-async def do_setting(update, context, text):
-    setting_key = context.user_data.pop('awaiting_setting', None)
-
-    try:
-        value = int(text.strip())
-        if value <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ Send a positive number!")
+    if ud.get("broadcast_waiting"):
+        if not is_admin(uid):
+            return
+        ud["broadcast_waiting"] = False
+        sent = await broadcast_media(update, context)
+        await update.message.reply_text(f"📢 Media sent to *{sent}* users.", parse_mode=ParseMode.MARKDOWN)
         return
 
-    set_setting(setting_key, value)
-    labels = {
-        'daily_coins': 'Daily Coins',
-        'referral_coins': 'Referral Coins',
-        'follow_delay': 'Follow Delay (seconds)'
-    }
-    await update.message.reply_text(f"✅ {labels.get(setting_key, setting_key)} set to {value}!")
+    doc = update.message.document
+    if doc and is_admin(uid):
+        ud.pop("upload_waiting", None)
+        ud.pop("awaiting", None)
+        try:
+            f = await doc.get_file()
+            raw = await f.download_as_bytearray()
+            content = raw.decode("utf-8", errors="ignore")
+            new, dup, err = await store_accounts(content)
+            notified = await notify_stock_update(context, new) if new > 0 else 0
+            await update.message.reply_text(
+                f"📦 File `{doc.file_name}`\n✅ New: {new} | ⏭️ Dup: {dup} | ❌ Err: {err}"
+                + (f"\n📢 Notified *{notified}* users!" if notified else ""),
+                parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Upload error: {e}")
+        return
 
-# ================= MAIN =================
+# ══════════════════════════════════════════════════════════════
+# ⚠️ ERROR HANDLER
+# ══════════════════════════════════════════════════════════════
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    if isinstance(context.error, BadRequest):
+        return
+    logger.error("Exception: %s", context.error)
+
+# ══════════════════════════════════════════════════════════════
+# 🚀 MAIN
+# ══════════════════════════════════════════════════════════════
+async def post_init(app: Application):
+    await app.bot.set_my_commands([
+        BotCommand("start", "🏠 Home"),
+        BotCommand("follow", "🚀 Follow"),
+        BotCommand("profile", "👤 Profile"),
+        BotCommand("refer", "👥 Refer"),
+        BotCommand("leaderboard", "🏆 Leaderboard"),
+        BotCommand("help", "📖 Help"),
+        BotCommand("cancel", "⛔ Stop"),
+        BotCommand("admin", "⚙️ Admin"),
+        BotCommand("stock", "📦 Stock"),
+        BotCommand("logs", "📜 Logs"),
+        BotCommand("errorlogs", "⚠️ Errors"),
+        BotCommand("broadcast", "📢 Broadcast"),
+        BotCommand("upload", "📤 Upload"),
+    ])
+
 def main():
-    global bot_instance
+    try:
+        _client.admin.command("ping")
+        srv = _client.server_info()
+        logger.info("✅ MongoDB CONNECTED — %s", srv.get("version", "?"))
+        logger.info("📦 users=%d | accounts=%d | admins=%d",
+                    users_coll.count_documents({}),
+                    accounts_coll.count_documents({}),
+                    admin_coll.count_documents({}))
+    except Exception as e:
+        logger.error("❌ MongoDB connection FAILED: %s", e)
 
-    print("🤖 Starting bot...")
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    bot_instance = FollowBot(BOT_TOKEN)
+    # All handlers
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("profile", cmd_profile))
+    app.add_handler(CommandHandler("refer", cmd_refer))
+    app.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
+    app.add_handler(CommandHandler("follow", cmd_follow))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("addcoin", cmd_addcoin))
+    app.add_handler(CommandHandler("addcoins", cmd_addcoin))
+    app.add_handler(CommandHandler("removecoin", cmd_removecoin))
+    app.add_handler(CommandHandler("removecoins", cmd_removecoin))
+    app.add_handler(CommandHandler("ban", cmd_ban))
+    app.add_handler(CommandHandler("unban", cmd_unban))
+    app.add_handler(CommandHandler("stock", cmd_stock))
+    app.add_handler(CommandHandler("logs", cmd_logs))
+    app.add_handler(CommandHandler("errorlogs", cmd_error_logs))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CommandHandler("upload", cmd_upload))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.UpdateType.CHANNEL_POST & ~filters.UpdateType.EDITED_MESSAGE & ~filters.UpdateType.EDITED_CHANNEL_POST, handle_message))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND & ~filters.UpdateType.CHANNEL_POST & ~filters.UpdateType.EDITED_MESSAGE & ~filters.UpdateType.EDITED_CHANNEL_POST, handle_media))
+    app.add_error_handler(error_handler)
 
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .concurrent_updates(True)   # handle 2+ requests simultaneously (no queue/freeze)
-        .build()
-    )
-
-    # Command handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("follow", follow_command))
-    application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(CommandHandler("referrals", referrals_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("admin", admin_command))
-    application.add_handler(CommandHandler("cancel", cancel_command))
-
-    # Single callback handler routes everything
-    application.add_handler(CallbackQueryHandler(button_handler))
-
-    # Single text message handler (dispatches all awaiting states)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-
-    application.add_error_handler(error_handler)
-
-    print(f"✅ Bot running! Admin: {ADMIN_IDS}")
-    print(f"👥 Users: {get_total_users()}")
-    print(f"📁 Accounts: {get_accounts_count()}")
-
-    application.run_polling()
+    logger.info("🔥 ULTRA FAST BOT ONLINE (v6.1)…")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n🛑 Bot stopped")
-        sys.exit(0)
+    main()
