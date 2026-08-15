@@ -90,4 +90,3 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_WORKSHOPCREATORSTATS']._serialized_start=4770
   _globals['_WORKSHOPCREATORSTATS']._serialized_end=4972
 # @@protoc_insertion_point(module_scope)
-
