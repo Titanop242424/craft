@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🔥 FF CARFT LAND FOLLOW BOT — ULTRA FAST EDITION (v6.2)
+🔥 FF CARFT LAND FOLLOW BOT — ULTRA FAST EDITION (v6.3)
 • All commands defined
 • Instant response with aggressive concurrency
 • 128 thread executor for maximum parallelism
 • Non-blocking notifications
+• Fixed broadcast with proper error handling
 """
 
 import asyncio
@@ -26,7 +27,7 @@ from bson import ObjectId
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden, TimedOut, NetworkError
 from telegram.helpers import escape_markdown
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -565,10 +566,17 @@ async def notify_admin_limit_reached(context: ContextTypes.DEFAULT_TYPE, uid: st
 # ══════════════════════════════════════════════════════════════
 
 async def _send_single_notification(context: ContextTypes.DEFAULT_TYPE, uid: int, message: str):
-    """Send a single notification."""
+    """Send a single notification with proper error handling."""
     try:
         await context.bot.send_message(uid, message, parse_mode=ParseMode.MARKDOWN)
         return 1
+    except Forbidden:
+        # User blocked the bot - silently skip
+        return 0
+    except (BadRequest, TimedOut, NetworkError) as e:
+        # Log but don't crash
+        logger.debug(f"Failed to send to {uid}: {e}")
+        return 0
     except Exception:
         return 0
 
@@ -582,11 +590,15 @@ async def _send_notifications_async(context: ContextTypes.DEFAULT_TYPE, user_ids
     
     # Send in batches of 50 to avoid rate limits
     batch_size = 50
+    sent = 0
     for i in range(0, len(user_ids), batch_size):
         batch = user_ids[i:i+batch_size]
         tasks = [_send_single_notification(context, uid, message) for uid in batch]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Count successful sends (ignore exceptions)
+        sent += sum(1 for r in results if r == 1)
         await asyncio.sleep(0.1)  # Small delay between batches
+    logger.info(f"✅ Sent stock notification to {sent}/{len(user_ids)} users")
 
 async def notify_stock_update(context: ContextTypes.DEFAULT_TYPE, new: int) -> int:
     """Send stock notifications in background without blocking the bot."""
@@ -603,6 +615,84 @@ async def notify_stock_update(context: ContextTypes.DEFAULT_TYPE, new: int) -> i
     asyncio.create_task(_send_notifications_async(context, user_ids, new))
     
     # Return immediately - don't wait for notifications to complete
+    return len(user_ids)
+
+# ══════════════════════════════════════════════════════════════
+# 📢 BROADCAST — NON-BLOCKING WITH PROPER ERROR HANDLING
+# ══════════════════════════════════════════════════════════════
+
+async def _send_single_broadcast(context: ContextTypes.DEFAULT_TYPE, uid: int, message: str, parse_mode=None):
+    """Send a single broadcast message with proper error handling."""
+    try:
+        if parse_mode:
+            await context.bot.send_message(uid, message, parse_mode=parse_mode)
+        else:
+            await context.bot.send_message(uid, message)
+        return 1
+    except Forbidden:
+        # User blocked the bot - silently skip
+        return 0
+    except (BadRequest, TimedOut, NetworkError) as e:
+        logger.debug(f"Broadcast failed to {uid}: {e}")
+        return 0
+    except Exception:
+        return 0
+
+async def _send_broadcast_async(context: ContextTypes.DEFAULT_TYPE, user_ids: list, text: str, is_media: bool = False, update: Update = None):
+    """Send broadcast in background without blocking."""
+    sent = 0
+    
+    # If it's media broadcast, copy the message
+    if is_media and update:
+        batch_size = 30
+        for i in range(0, len(user_ids), batch_size):
+            batch = user_ids[i:i+batch_size]
+            tasks = []
+            for uid_ in batch:
+                try:
+                    await update.message.copy(uid_)
+                    sent += 1
+                except Forbidden:
+                    continue
+                except Exception:
+                    continue
+                await asyncio.sleep(0.05)
+            await asyncio.sleep(0.1)
+    else:
+        # Text broadcast
+        batch_size = 50
+        for i in range(0, len(user_ids), batch_size):
+            batch = user_ids[i:i+batch_size]
+            tasks = [_send_single_broadcast(context, uid, text, ParseMode.MARKDOWN) for uid in batch]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            sent += sum(1 for r in results if r == 1)
+            await asyncio.sleep(0.1)
+    
+    logger.info(f"✅ Broadcast sent to {sent}/{len(user_ids)} users")
+    return sent
+
+async def do_text_broadcast(context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    """Start text broadcast in background."""
+    user_ids = await _run(lambda: [u["_id"] for u in users_coll.find({}, {"_id": 1})])
+    
+    if not user_ids:
+        return 0
+    
+    # Run in background
+    asyncio.create_task(_send_broadcast_async(context, user_ids, text, False))
+    
+    return len(user_ids)
+
+async def broadcast_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start media broadcast in background."""
+    user_ids = await _run(lambda: [u["_id"] for u in users_coll.find({}, {"_id": 1})])
+    
+    if not user_ids:
+        return 0
+    
+    # Run in background
+    asyncio.create_task(_send_broadcast_async(context, user_ids, "", True, update))
+    
     return len(user_ids)
 
 # ══════════════════════════════════════════════════════════════
@@ -1096,31 +1186,6 @@ def error_logs_text() -> str:
                      f"   📝 {e['error_detail'][:50]}… @ {e['at'].strftime('%m-%d %H:%M')}")
     return f"{box('⚠️ ERROR LOGS')}\n" + ("\n".join(lines) if lines else "No errors.")
 
-async def do_text_broadcast(context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
-    sent = 0
-    user_ids = await _run(lambda: [u["_id"] for u in users_coll.find({}, {"_id": 1})])
-    for uid_ in user_ids:
-        try:
-            await context.bot.send_message(uid_, f"📢 *Broadcast*\n\n{text}",
-                                           parse_mode=ParseMode.MARKDOWN)
-            sent += 1
-        except Exception:
-            pass
-        await asyncio.sleep(0.05)
-    return sent
-
-async def broadcast_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    sent = 0
-    user_ids = await _run(lambda: [u["_id"] for u in users_coll.find({}, {"_id": 1})])
-    for uid_ in user_ids:
-        try:
-            await update.message.copy(uid_)
-            sent += 1
-        except Exception:
-            pass
-        await asyncio.sleep(0.05)
-    return sent
-
 def store_accounts_sync(content: str):
     accounts = parse_accounts(content)
     new = dup = err = 0
@@ -1211,12 +1276,18 @@ async def cmd_error_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @require_admin
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
-        sent = await do_text_broadcast(context, " ".join(context.args))
-        await update.message.reply_text(f"📢 Sent to *{sent}* users.", parse_mode=ParseMode.MARKDOWN)
+        # Start broadcast in background
+        total = await do_text_broadcast(context, " ".join(context.args))
+        await update.message.reply_text(
+            f"📢 *Broadcast started!*\n"
+            f"📊 Sending to *{total}* users in background...\n"
+            f"⏳ Bot will remain responsive.",
+            parse_mode=ParseMode.MARKDOWN)
         return
     context.user_data["broadcast_waiting"] = True
     await update.message.reply_text(
-        "📢 *Broadcast armed!*\nSend message/file.\n`/cancel` to abort.",
+        "📢 *Broadcast armed!*\nSend message/file.\n`/cancel` to abort.\n"
+        "✅ Bot stays responsive during broadcast.",
         parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
 
 @require_admin
@@ -1372,7 +1443,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ud.pop("awaiting", None)
             if data == "action_broadcast":
                 ud["broadcast_waiting"] = True
-                title, hint = "📢 Broadcast", "Send message/file."
+                title, hint = "📢 Broadcast", "Send message/file.\n✅ Bot stays responsive!"
             elif data == "action_upload":
                 ud["upload_waiting"] = True
                 title, hint = "📤 Upload", "Send accounts file/text."
@@ -1422,8 +1493,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(uid):
             return
         ud["broadcast_waiting"] = False
-        sent = await do_text_broadcast(context, text)
-        await update.message.reply_text(f"📢 Sent to *{sent}* users.", parse_mode=ParseMode.MARKDOWN)
+        # Start broadcast in background
+        total = await do_text_broadcast(context, text)
+        await update.message.reply_text(
+            f"📢 *Broadcast started!*\n"
+            f"📊 Sending to *{total}* users in background...\n"
+            f"✅ Bot remains responsive.",
+            parse_mode=ParseMode.MARKDOWN)
         return
 
     if ud.get("upload_waiting"):
@@ -1533,8 +1609,13 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(uid):
             return
         ud["broadcast_waiting"] = False
-        sent = await broadcast_media(update, context)
-        await update.message.reply_text(f"📢 Media sent to *{sent}* users.", parse_mode=ParseMode.MARKDOWN)
+        # Start media broadcast in background
+        total = await broadcast_media(update, context)
+        await update.message.reply_text(
+            f"📢 *Media broadcast started!*\n"
+            f"📊 Sending to *{total}* users in background...\n"
+            f"✅ Bot remains responsive.",
+            parse_mode=ParseMode.MARKDOWN)
         return
 
     doc = update.message.document
@@ -1561,7 +1642,13 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(context.error, BadRequest):
         return
-    logger.error("Exception: %s", context.error)
+    if isinstance(context.error, Forbidden):
+        # User blocked the bot - silently ignore
+        return
+    if isinstance(context.error, (TimedOut, NetworkError)):
+        logger.warning(f"Network error: {context.error}")
+        return
+    logger.error(f"Exception: {context.error}")
 
 # ══════════════════════════════════════════════════════════════
 # 🚀 MAIN
@@ -1622,12 +1709,8 @@ def main():
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND & ~filters.UpdateType.CHANNEL_POST & ~filters.UpdateType.EDITED_MESSAGE & ~filters.UpdateType.EDITED_CHANNEL_POST, handle_media))
     app.add_error_handler(error_handler)
 
-    logger.info("🔥 ULTRA FAST BOT ONLINE (v6.2 - Non-blocking Notifications)…")
+    logger.info("🔥 ULTRA FAST BOT ONLINE (v6.3 - Fixed Broadcast)…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
-
-# python3 -m pip uninstall protobuf google -y
-# python3 -m pip install protobuf==7.35.1
-# python3 -m pip install google==3.0.0
